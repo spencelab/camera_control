@@ -1036,11 +1036,14 @@ class CameraPanel(QtWidgets.QGroupBox):
             md.write_session_yaml()
             session_dir = md.session_dir()
             node = safe_token(full.strip("/"), "cam")
+            node_dir = session_dir / node
+            node_dir.mkdir(parents=True, exist_ok=True)
+
             prefix = md.node_prefix(node)
-            settings["output.dir"] = str(session_dir / node)
+            settings["output.dir"] = str(node_dir)
             settings["output.prefix"] = prefix
-            settings["metadata_path"] = str(session_dir / node / f"{prefix}.metadata.yaml")
-            # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
+            settings["metadata_path"] = str(node_dir / f"{prefix}.metadata.yaml")            # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
+             # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
             settings["session.session_yaml"] = str(session_dir / "session.yaml")
             settings["session.experiment_id"] = md.experiment_id
             settings["session.animal_id"] = md.animal_id
