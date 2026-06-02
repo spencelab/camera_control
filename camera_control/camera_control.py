@@ -40,6 +40,19 @@ from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
 from cambuffer_recorder_ng.srv import ApplySettings, GetStatus
 
+try:
+    from treadmill_control.msg import TreadmillStatus
+    from treadmill_control.srv import Connect as TreadmillConnect
+    from treadmill_control.srv import DetectPort as TreadmillDetectPort
+    from treadmill_control.srv import SetSpeed as TreadmillSetSpeed
+    TREADMILL_CONTROL_AVAILABLE = True
+except Exception:
+    TreadmillStatus = None
+    TreadmillConnect = None
+    TreadmillDetectPort = None
+    TreadmillSetSpeed = None
+    TREADMILL_CONTROL_AVAILABLE = False
+
 
 DISCOVERY_INTERVAL_MS = 1500
 STATUS_INTERVAL_MS = 1000
@@ -252,6 +265,9 @@ class CameraControlRos(Node):
         self._start_clients: Dict[str, Any] = {}
         self._stop_clients: Dict[str, Any] = {}
         self._event_subs: Dict[str, Any] = {}
+        self._treadmill_clients: Dict[str, Any] = {}
+        self._treadmill_status_sub = None
+        self._treadmill_status_callback = None
         self._event_callback = None
 
     def set_event_callback(self, callback):
@@ -345,6 +361,66 @@ class CameraControlRos(Node):
         suffix = "start_recording" if start else "stop_recording"
         cli = self._client(cache, Trigger, full_name, suffix)
         return cli.call_async(Trigger.Request())
+
+    # ---- treadmill_control client helpers ----
+    def treadmill_available(self) -> bool:
+        return bool(TREADMILL_CONTROL_AVAILABLE)
+
+    def set_treadmill_status_callback(self, callback):
+        self._treadmill_status_callback = callback
+        if not self.treadmill_available() or TreadmillStatus is None:
+            return
+        if self._treadmill_status_sub is None:
+            self._treadmill_status_sub = self.create_subscription(
+                TreadmillStatus,
+                "/treadmill_host/status",
+                self._on_treadmill_status,
+                10,
+            )
+
+    def _on_treadmill_status(self, msg):
+        if self._treadmill_status_callback is not None:
+            self._treadmill_status_callback(msg)
+
+    def _treadmill_client(self, srv_type: Any, service_name: str):
+        if srv_type is None:
+            return None
+        if service_name not in self._treadmill_clients:
+            self._treadmill_clients[service_name] = self.create_client(srv_type, service_name)
+        return self._treadmill_clients[service_name]
+
+    def treadmill_connect_async(self, port: str):
+        cli = self._treadmill_client(TreadmillConnect, "/treadmill_host/connect")
+        if cli is None:
+            return None
+        req = TreadmillConnect.Request()
+        req.port = port
+        return cli.call_async(req)
+
+    def treadmill_detect_async(self, preferred_port: str = ""):
+        cli = self._treadmill_client(TreadmillDetectPort, "/treadmill_host/detect_port")
+        if cli is None:
+            return None
+        req = TreadmillDetectPort.Request()
+        req.preferred_port = preferred_port
+        return cli.call_async(req)
+
+    def treadmill_trigger_async(self, action: str):
+        allowed = {"disconnect", "take_control", "release_control", "run", "stop"}
+        if action not in allowed:
+            raise ValueError(f"unknown treadmill trigger action: {action}")
+        cli = self._treadmill_client(Trigger, f"/treadmill_host/{action}")
+        if cli is None:
+            return None
+        return cli.call_async(Trigger.Request())
+
+    def treadmill_set_speed_async(self, speed_cm_s: int):
+        cli = self._treadmill_client(TreadmillSetSpeed, "/treadmill_host/set_speed")
+        if cli is None:
+            return None
+        req = TreadmillSetSpeed.Request()
+        req.speed_cm_s = int(speed_cm_s)
+        return cli.call_async(req)
 
 
 # --------------------------
@@ -1162,6 +1238,224 @@ class CameraPanel(QtWidgets.QGroupBox):
 
 
 # --------------------------
+# Treadmill panel
+# --------------------------
+class TreadmillPanel(QtWidgets.QGroupBox):
+    status_changed = QtCore.Signal(object)
+
+    def __init__(self, ros: CameraControlRos):
+        super().__init__("Treadmill Control")
+        self.ros = ros
+        self.latest_status = None
+        self.commanded_speed = 0
+
+        self.use_treadmill = QtWidgets.QCheckBox("Use treadmill")
+        self.port_edit = QtWidgets.QLineEdit("/dev/treadmill1")
+        self.detect_btn = QtWidgets.QPushButton("Detect treadmill port…")
+        self.connect_btn = QtWidgets.QPushButton("Connect")
+        self.disconnect_btn = QtWidgets.QPushButton("Disconnect")
+        self.take_control_btn = QtWidgets.QPushButton("Take control")
+        self.release_control_btn = QtWidgets.QPushButton("Release control")
+        self.run_btn = QtWidgets.QPushButton("Run")
+        self.stop_btn = QtWidgets.QPushButton("Stop")
+        self.speed_spin = QtWidgets.QSpinBox()
+        self.speed_spin.setRange(0, 100)
+        self.speed_spin.setSuffix(" cm/s")
+        self.speed_spin.setSingleStep(2)
+        self.set_speed_btn = QtWidgets.QPushButton("Set speed")
+        self.down_btn = QtWidgets.QPushButton("-2")
+        self.up_btn = QtWidgets.QPushButton("+2")
+        self.status_label = QtWidgets.QLabel("Treadmill: not connected")
+        self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+
+        if not self.ros.treadmill_available():
+            self.status_label.setText("Treadmill: treadmill_control package not sourced/built")
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("", self.use_treadmill)
+
+        port_row = QtWidgets.QHBoxLayout()
+        port_row.addWidget(self.port_edit, stretch=1)
+        port_row.addWidget(self.detect_btn)
+        form.addRow("Port", port_row)
+
+        control_grid = QtWidgets.QGridLayout()
+        control_grid.addWidget(self.connect_btn, 0, 0)
+        control_grid.addWidget(self.disconnect_btn, 0, 1)
+        control_grid.addWidget(self.take_control_btn, 1, 0)
+        control_grid.addWidget(self.release_control_btn, 1, 1)
+        control_grid.addWidget(self.run_btn, 2, 0)
+        control_grid.addWidget(self.stop_btn, 2, 1)
+
+        speed_row = QtWidgets.QHBoxLayout()
+        speed_row.addWidget(self.speed_spin)
+        speed_row.addWidget(self.set_speed_btn)
+        speed_row.addWidget(self.down_btn)
+        speed_row.addWidget(self.up_btn)
+        speed_row.addStretch(1)
+
+        preset_grid = QtWidgets.QGridLayout()
+        for i, speed in enumerate(list(range(0, 100, 10)) + [100]):
+            btn = QtWidgets.QPushButton(str(speed))
+            btn.clicked.connect(lambda checked=False, s=speed: self.set_speed(s))
+            preset_grid.addWidget(btn, i // 6, i % 6)
+
+        help_label = QtWidgets.QLabel("Keys when Use treadmill is checked: c control, r run/stop, 0-9 speeds 0-90, [ ] +/-2 cm/s")
+        help_label.setWordWrap(True)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(form)
+        layout.addLayout(control_grid)
+        layout.addWidget(QtWidgets.QLabel("Speed presets (cm/s)"))
+        layout.addLayout(preset_grid)
+        layout.addLayout(speed_row)
+        layout.addWidget(self.status_label)
+        layout.addWidget(help_label)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+        self.detect_btn.clicked.connect(self.detect_port)
+        self.connect_btn.clicked.connect(self.connect_treadmill)
+        self.disconnect_btn.clicked.connect(lambda: self.trigger("disconnect"))
+        self.take_control_btn.clicked.connect(lambda: self.trigger("take_control"))
+        self.release_control_btn.clicked.connect(lambda: self.trigger("release_control"))
+        self.run_btn.clicked.connect(lambda: self.trigger("run"))
+        self.stop_btn.clicked.connect(lambda: self.trigger("stop"))
+        self.set_speed_btn.clicked.connect(lambda: self.set_speed(self.speed_spin.value()))
+        self.down_btn.clicked.connect(lambda: self.bump_speed(-2))
+        self.up_btn.clicked.connect(lambda: self.bump_speed(2))
+
+        self.ros.set_treadmill_status_callback(self.update_from_status)
+
+    def enabled_for_keys(self) -> bool:
+        return self.use_treadmill.isChecked() and self.ros.treadmill_available()
+
+    def _future_or_warn(self, fut, label: str):
+        if fut is None:
+            self.log("treadmill_control package is not available; build/source treadmill_control first")
+            return
+        fut.add_done_callback(lambda f, label=label: self._service_done(label, f))
+
+    def _service_done(self, label: str, fut):
+        try:
+            resp = fut.result()
+        except Exception as e:
+            self.log(f"treadmill {label}: FAIL - {e}")
+            return
+        success = getattr(resp, "success", False)
+        message = getattr(resp, "message", "")
+        if hasattr(resp, "port") and getattr(resp, "port"):
+            self.port_edit.setText(str(getattr(resp, "port")))
+        if hasattr(resp, "speed_cm_s"):
+            self.commanded_speed = int(getattr(resp, "speed_cm_s"))
+            self.speed_spin.setValue(self.commanded_speed)
+        self.log(f"treadmill {label}: {'OK' if success else 'FAIL'} - {message}")
+
+    def detect_port(self):
+        fut = self.ros.treadmill_detect_async(self.port_edit.text().strip())
+        self._future_or_warn(fut, "detect_port")
+
+    def connect_treadmill(self):
+        fut = self.ros.treadmill_connect_async(self.port_edit.text().strip())
+        self._future_or_warn(fut, "connect")
+
+    def trigger(self, action: str):
+        fut = self.ros.treadmill_trigger_async(action)
+        self._future_or_warn(fut, action)
+
+    def set_speed(self, speed: int):
+        speed = max(0, min(100, int(speed)))
+        self.speed_spin.setValue(speed)
+        self.commanded_speed = speed
+        fut = self.ros.treadmill_set_speed_async(speed)
+        self._future_or_warn(fut, f"set_speed {speed}")
+
+    def bump_speed(self, delta: int):
+        base = self.commanded_speed
+        if self.latest_status is not None and getattr(self.latest_status, "commanded_speed_cm_s", -1) >= 0:
+            base = int(self.latest_status.commanded_speed_cm_s)
+        self.set_speed(base + int(delta))
+
+    def handle_key(self, key: int, text: str) -> bool:
+        if not self.enabled_for_keys():
+            return False
+        if text == "c":
+            controlled = bool(getattr(self.latest_status, "controlled", False)) if self.latest_status is not None else False
+            self.trigger("release_control" if controlled else "take_control")
+            return True
+        if text == "r":
+            running = bool(getattr(self.latest_status, "running", False)) if self.latest_status is not None else False
+            self.trigger("stop" if running else "run")
+            return True
+        if text in "0123456789":
+            self.set_speed(int(text) * 10)
+            return True
+        if text == "[":
+            self.bump_speed(-2)
+            return True
+        if text == "]":
+            self.bump_speed(2)
+            return True
+        return False
+
+    def update_from_status(self, msg):
+        self.latest_status = msg
+        if getattr(msg, "commanded_speed_cm_s", -1) >= 0:
+            self.commanded_speed = int(msg.commanded_speed_cm_s)
+            if not self.speed_spin.hasFocus():
+                self.speed_spin.setValue(self.commanded_speed)
+        self.status_label.setText(self.summary_text(msg))
+        self.status_changed.emit(msg)
+
+    def summary_text(self, msg=None) -> str:
+        if not self.ros.treadmill_available():
+            return "Treadmill: package missing"
+        if msg is None:
+            msg = self.latest_status
+        if msg is None:
+            return f"Treadmill: waiting for /treadmill_host/status | Port: {self.port_edit.text().strip()}"
+        yes = "✅"
+        no = "❌"
+        detected = yes if getattr(msg, "detected", False) else no
+        connected = yes if getattr(msg, "connected", False) else no
+        controlled = yes if getattr(msg, "controlled", False) else no
+        running = yes if getattr(msg, "running", False) else no
+        cmd = getattr(msg, "commanded_speed_cm_s", -1)
+        rep = getattr(msg, "reported_speed_cm_s", -1)
+        speed = f"cmd {cmd} cm/s" if cmd >= 0 else "cmd --"
+        if rep >= 0:
+            speed += f", reported {rep} cm/s"
+        port = getattr(msg, "port", "") or self.port_edit.text().strip()
+        err = getattr(msg, "error", "")
+        tail = f" | Error: {err}" if err else ""
+        return (
+            f"Treadmill: Detected {detected}  Connected {connected}  "
+            f"Controlled {controlled}  Running {running}  Speed: {speed}  Port: {port}{tail}"
+        )
+
+    def log(self, msg: str):
+        parent = self.window()
+        if hasattr(parent, "append_log"):
+            parent.append_log(msg)
+        else:
+            print(msg)
+
+
+class TreadmillSummary(QtWidgets.QFrame):
+    def __init__(self, treadmill_panel: TreadmillPanel):
+        super().__init__()
+        self.treadmill_panel = treadmill_panel
+        self.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        self.label = QtWidgets.QLabel(treadmill_panel.summary_text())
+        self.label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        layout = QtWidgets.QHBoxLayout()
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.addWidget(self.label, stretch=1)
+        self.setLayout(layout)
+        treadmill_panel.status_changed.connect(lambda msg: self.label.setText(treadmill_panel.summary_text(msg)))
+
+
+# --------------------------
 # Main window
 # --------------------------
 class MainWindow(QtWidgets.QMainWindow):
@@ -1173,6 +1467,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.metadata_panel = MetadataPanel()
         self.metadata_summary = MetadataSummary(self.metadata_panel)
+        self.treadmill_panel = TreadmillPanel(ros)
+        self.treadmill_summary = TreadmillSummary(self.treadmill_panel)
         self.camera_panel = CameraPanel(ros, self.metadata_panel)
         self.ros.set_event_callback(self.append_log)
 
@@ -1194,6 +1490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         cam_layout = QtWidgets.QVBoxLayout()
         cam_layout.setContentsMargins(6, 6, 6, 6)
         cam_layout.addWidget(self.metadata_summary)
+        cam_layout.addWidget(self.treadmill_summary)
         cam_layout.addWidget(self.camera_panel, stretch=1)
 
         log_header = QtWidgets.QHBoxLayout()
@@ -1221,6 +1518,14 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_meta.setLayout(meta_layout)
         self.tabs.addTab(tab_meta, "Metadata")
 
+        tab_treadmill = QtWidgets.QWidget()
+        treadmill_layout = QtWidgets.QVBoxLayout()
+        treadmill_layout.setContentsMargins(12, 12, 12, 12)
+        treadmill_layout.addWidget(self.treadmill_panel)
+        treadmill_layout.addStretch(1)
+        tab_treadmill.setLayout(treadmill_layout)
+        self.tabs.addTab(tab_treadmill, "Treadmill")
+
         tab_preview = QtWidgets.QWidget()
         preview_layout = QtWidgets.QVBoxLayout()
         preview_layout.addWidget(QtWidgets.QLabel(
@@ -1238,6 +1543,13 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.metadata_summary.edit_requested.connect(self.goto_metadata_tab)
         QtCore.QTimer.singleShot(100, self.camera_panel.discover)
+
+    def keyPressEvent(self, event):
+        text = event.text()
+        if hasattr(self, "treadmill_panel") and self.treadmill_panel.handle_key(event.key(), text):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def goto_metadata_tab(self):
         self.tabs.setCurrentIndex(1)
