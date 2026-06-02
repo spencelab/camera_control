@@ -1,0 +1,68 @@
+# startup_hosts.yaml
+# Place this next to the camera_control package root, e.g.:
+#   ~/ros2_ws/src/camera_control/startup_hosts.yaml
+# The Startup/Shutdown tab loads this file. If missing, it uses built-in defaults.
+
+hosts:
+  - label: local
+    hostname: local
+    ip: local
+    user: spencelab
+    workspace: ~/ros2_ws
+    ros_distro: humble
+    default_camera_node: cam1
+    default_triggerbox_node: triggerbox_host
+    notes: This computer
+
+  - label: ros2test
+    hostname: ros2test
+    ip: 10.0.0.22
+    user: spencelab
+    workspace: ~/ros2_ws
+    ros_distro: humble
+    default_camera_node: cam2
+    default_triggerbox_node: triggerbox_host
+    notes: Example remote camera host; edit IP/node/config as needed
+
+  - label: camdev
+    hostname: camdev
+    ip: 10.0.0.21
+    user: spencelab
+    workspace: ~/ros2_ws
+    ros_distro: humble
+    default_camera_node: cam1
+    default_triggerbox_node: triggerbox_host
+    notes: Example dev machine; edit as needed
+
+camera_profiles:
+  - label: none
+    params_file: none
+    package: cambuffer_recorder_ng
+    executable: cambuffer_recorder_ng
+
+  - label: cam1 ximea mono8 rolling hwtrigger
+    params_file: ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml
+    package: cambuffer_recorder_ng
+    executable: cambuffer_recorder_ng
+
+  - label: ximea mono8 rolling hwtrigger
+    params_file: ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml
+    package: cambuffer_recorder_ng
+    executable: cambuffer_recorder_ng
+
+  - label: ximea mono8 rolling
+    params_file: ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling.yaml
+    package: cambuffer_recorder_ng
+    executable: cambuffer_recorder_ng
+
+  - label: fake raw8 BayerGBRG rolling
+    params_file: ~/ros2_ws/src/cambuffer_recorder_ng/config/fake_raw8bayerGBRG_rolling.yaml
+    package: cambuffer_recorder_ng
+    executable: cambuffer_recorder_ng
+
+triggerbox_profiles:
+  - label: triggerbox_host default
+    package: triggerbox_host
+    executable: triggerbox_host
+    args: ""
+    default_node: triggerbox_host

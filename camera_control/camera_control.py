@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-camera_control_tabs_metadata_v7.py
+camera_control_tabs_metadata_v8.py
 
-First-pass ROS2 + PySide6 camera cockpit for cambuffer_recorder_ng.
+First-pass ROS2 + PySide6 camera cockpit for cambuffer_recorder_ng, with Startup/Shutdown tab.
 
 What it does now:
   - Discovers camera nodes that expose /<node>/get_status
@@ -27,6 +27,8 @@ import os
 import re
 import sys
 import getpass
+import socket
+import shlex
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -1038,12 +1040,11 @@ class CameraPanel(QtWidgets.QGroupBox):
             node = safe_token(full.strip("/"), "cam")
             node_dir = session_dir / node
             node_dir.mkdir(parents=True, exist_ok=True)
-
             prefix = md.node_prefix(node)
             settings["output.dir"] = str(node_dir)
             settings["output.prefix"] = prefix
-            settings["metadata_path"] = str(node_dir / f"{prefix}.metadata.yaml")            # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
-             # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
+            settings["metadata_path"] = str(node_dir / f"{prefix}.metadata.yaml")
+            # These are harmless extra requested-settings keys. CBRNG metadata will preserve them.
             settings["session.session_yaml"] = str(session_dir / "session.yaml")
             settings["session.experiment_id"] = md.experiment_id
             settings["session.animal_id"] = md.animal_id
@@ -1161,6 +1162,532 @@ class CameraPanel(QtWidgets.QGroupBox):
             print(msg)
 
 
+
+# --------------------------
+# Startup / shutdown tab
+# --------------------------
+@dataclass
+class StartupHost:
+    label: str
+    hostname: str
+    ip: str
+    user: str = getpass.getuser()
+    workspace: str = "~/ros2_ws"
+    ros_distro: str = "humble"
+    default_camera_node: str = "cam1"
+    default_triggerbox_node: str = "triggerbox_host"
+    notes: str = ""
+
+    @property
+    def is_local(self) -> bool:
+        return self.ip.lower() in ("local", "localhost", "127.0.0.1") or self.hostname.lower() in ("local", "localhost", socket.gethostname().lower())
+
+    def ssh_target(self) -> str:
+        return f"{self.user}@{self.ip}"
+
+
+@dataclass
+class CameraLaunchProfile:
+    label: str
+    params_file: str = "none"
+    package: str = "cambuffer_recorder_ng"
+    executable: str = "cambuffer_recorder_ng"
+
+
+@dataclass
+class GenericLaunchProfile:
+    label: str
+    package: str
+    executable: str
+    args: str = ""
+    default_node: str = "triggerbox_host"
+
+
+@dataclass
+class StartupConfig:
+    hosts: List[StartupHost]
+    camera_profiles: List[CameraLaunchProfile]
+    triggerbox_profiles: List[GenericLaunchProfile]
+
+
+def startup_config_path() -> Path:
+    # camera_control/camera_control.py -> repo/package root is parents[1]
+    try:
+        return Path(__file__).resolve().parents[1] / "startup_hosts.yaml"
+    except Exception:
+        return Path.cwd() / "startup_hosts.yaml"
+
+
+def default_startup_config() -> StartupConfig:
+    user = getpass.getuser()
+    hostname = socket.gethostname()
+    ws = "~/ros2_ws"
+    hosts = [
+        StartupHost(label="local", hostname=hostname, ip="local", user=user, workspace=ws, ros_distro="humble", default_camera_node="cam1", notes="This computer"),
+        StartupHost(label="camdev", hostname="camdev", ip="10.0.0.21", user=user, workspace=ws, ros_distro="humble", default_camera_node="cam1"),
+        StartupHost(label="ros2test", hostname="ros2test", ip="10.0.0.22", user=user, workspace=ws, ros_distro="humble", default_camera_node="cam2"),
+    ]
+    camera_profiles = [
+        CameraLaunchProfile("none", "none"),
+        CameraLaunchProfile("cam1 ximea mono8 rolling hwtrigger", "~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"),
+        CameraLaunchProfile("ximea mono8 rolling hwtrigger", "~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"),
+        CameraLaunchProfile("ximea mono8 rolling", "~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling.yaml"),
+        CameraLaunchProfile("fake raw8 BayerGBRG rolling", "~/ros2_ws/src/cambuffer_recorder_ng/config/fake_raw8bayerGBRG_rolling.yaml"),
+    ]
+    triggerbox_profiles = [
+        GenericLaunchProfile("triggerbox_host default", "triggerbox_host", "triggerbox_host", "", "triggerbox_host"),
+    ]
+    return StartupConfig(hosts=hosts, camera_profiles=camera_profiles, triggerbox_profiles=triggerbox_profiles)
+
+
+def load_startup_config(path: Optional[Path] = None) -> StartupConfig:
+    path = path or startup_config_path()
+    if not path.exists():
+        return default_startup_config()
+    try:
+        import yaml  # type: ignore
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        hosts = [StartupHost(**item) for item in raw.get("hosts", [])]
+        camera_profiles = [CameraLaunchProfile(**item) for item in raw.get("camera_profiles", [])]
+        triggerbox_profiles = [GenericLaunchProfile(**item) for item in raw.get("triggerbox_profiles", [])]
+        cfg = default_startup_config()
+        return StartupConfig(
+            hosts=hosts or cfg.hosts,
+            camera_profiles=camera_profiles or cfg.camera_profiles,
+            triggerbox_profiles=triggerbox_profiles or cfg.triggerbox_profiles,
+        )
+    except Exception as e:
+        print(f"Failed to load {path}: {e}; using defaults", file=sys.stderr)
+        return default_startup_config()
+
+
+class LaunchCameraDialog(QtWidgets.QDialog):
+    def __init__(self, host: StartupHost, profiles: List[CameraLaunchProfile], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Launch Camera")
+        self.host = host
+        self.profiles = profiles
+
+        self.node_name = QtWidgets.QLineEdit(host.default_camera_node or "cam1")
+        self.profile_combo = QtWidgets.QComboBox()
+        for prof in profiles:
+            self.profile_combo.addItem(prof.label, prof)
+        self.params_file = QtWidgets.QLineEdit(profiles[0].params_file if profiles else "none")
+        self.package = QtWidgets.QLineEdit(profiles[0].package if profiles else "cambuffer_recorder_ng")
+        self.executable = QtWidgets.QLineEdit(profiles[0].executable if profiles else "cambuffer_recorder_ng")
+        self.extra_ros_args = QtWidgets.QLineEdit()
+        self.extra_ros_args.setPlaceholderText("optional, e.g. -p camera.width:=2048")
+
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+        self._profile_changed(0)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("Host", QtWidgets.QLabel(f"{host.label} ({host.ip})"))
+        form.addRow("Node name", self.node_name)
+        form.addRow("Settings profile", self.profile_combo)
+        form.addRow("Params file", self.params_file)
+        form.addRow("Package", self.package)
+        form.addRow("Executable", self.executable)
+        form.addRow("Extra ROS args", self.extra_ros_args)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(650, 220)
+
+    def _profile_changed(self, idx: int):
+        prof = self.profile_combo.currentData()
+        if not prof:
+            return
+        self.params_file.setText(prof.params_file)
+        self.package.setText(prof.package)
+        self.executable.setText(prof.executable)
+
+    def command(self, host: StartupHost) -> Tuple[str, str]:
+        node = safe_token(self.node_name.text().strip(), host.default_camera_node or "cam1")
+        package = self.package.text().strip() or "cambuffer_recorder_ng"
+        executable = self.executable.text().strip() or "cambuffer_recorder_ng"
+        params = self.params_file.text().strip()
+        extra = self.extra_ros_args.text().strip()
+        args = [f"-r __node:={node}"]
+        if params and params.lower() not in ("none", "no", "null", ""):
+            args.append(f"--params-file {shlex.quote(params)}")
+        if extra:
+            args.append(extra)
+        setup = f"source /opt/ros/{shlex.quote(host.ros_distro)}/setup.bash && source {shlex.quote(host.workspace)}/install/setup.bash"
+        cmd = f"{setup} && ros2 run {shlex.quote(package)} {shlex.quote(executable)} --ros-args " + " ".join(args)
+        return node, cmd
+
+
+class LaunchTriggerboxDialog(QtWidgets.QDialog):
+    def __init__(self, host: StartupHost, profiles: List[GenericLaunchProfile], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Launch Triggerbox")
+        self.host = host
+        self.profiles = profiles
+        default_profile = profiles[0] if profiles else GenericLaunchProfile("triggerbox_host default", "triggerbox_host", "triggerbox_host")
+
+        self.node_name = QtWidgets.QLineEdit(host.default_triggerbox_node or default_profile.default_node)
+        self.profile_combo = QtWidgets.QComboBox()
+        for prof in profiles:
+            self.profile_combo.addItem(prof.label, prof)
+        self.package = QtWidgets.QLineEdit(default_profile.package)
+        self.executable = QtWidgets.QLineEdit(default_profile.executable)
+        self.args = QtWidgets.QLineEdit(default_profile.args)
+        self.args.setPlaceholderText("optional package args before --ros-args")
+        self.extra_ros_args = QtWidgets.QLineEdit()
+        self.extra_ros_args.setPlaceholderText("optional ROS args")
+        self.profile_combo.currentIndexChanged.connect(self._profile_changed)
+
+        form = QtWidgets.QFormLayout()
+        form.addRow("Host", QtWidgets.QLabel(f"{host.label} ({host.ip})"))
+        form.addRow("Node name", self.node_name)
+        form.addRow("Profile", self.profile_combo)
+        form.addRow("Package", self.package)
+        form.addRow("Executable", self.executable)
+        form.addRow("Package args", self.args)
+        form.addRow("Extra ROS args", self.extra_ros_args)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QtWidgets.QVBoxLayout()
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+        self.resize(650, 220)
+
+    def _profile_changed(self, idx: int):
+        prof = self.profile_combo.currentData()
+        if not prof:
+            return
+        self.package.setText(prof.package)
+        self.executable.setText(prof.executable)
+        self.args.setText(prof.args)
+        if not self.node_name.text().strip():
+            self.node_name.setText(prof.default_node)
+
+    def command(self, host: StartupHost) -> Tuple[str, str]:
+        node = safe_token(self.node_name.text().strip(), host.default_triggerbox_node or "triggerbox_host")
+        package = self.package.text().strip() or "triggerbox_host"
+        executable = self.executable.text().strip() or "triggerbox_host"
+        pkg_args = self.args.text().strip()
+        extra_ros_args = self.extra_ros_args.text().strip()
+        ros_args = f"--ros-args -r __node:={node}"
+        if extra_ros_args:
+            ros_args += " " + extra_ros_args
+        setup = f"source /opt/ros/{shlex.quote(host.ros_distro)}/setup.bash && source {shlex.quote(host.workspace)}/install/setup.bash"
+        cmd = f"{setup} && ros2 run {shlex.quote(package)} {shlex.quote(executable)}"
+        if pkg_args:
+            cmd += " " + pkg_args
+        cmd += " " + ros_args
+        return node, cmd
+
+
+class StartupShutdownPanel(QtWidgets.QWidget):
+    def __init__(self, ros: CameraControlRos, log_callback: Callable[[str], None]):
+        super().__init__()
+        self.ros = ros
+        self.log = log_callback
+        self.config_path = startup_config_path()
+        self.config = load_startup_config(self.config_path)
+        self.processes: Dict[str, QtCore.QProcess] = {}
+        self.node_host_map: Dict[str, str] = {}
+
+        self.nodes_table = QtWidgets.QTableWidget(0, 4)
+        self.nodes_table.setHorizontalHeaderLabels(["Node name", "Node type", "Host/IP", "Status"])
+        self.nodes_table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        self.nodes_table.horizontalHeader().setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+        self.nodes_table.horizontalHeader().setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+        self.nodes_table.horizontalHeader().setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
+        self.nodes_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.nodes_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+
+        self.hosts_table = QtWidgets.QTableWidget(0, 6)
+        self.hosts_table.setHorizontalHeaderLabels(["Label", "Hostname", "IP", "Ping", "SSH", "Notes"])
+        self.hosts_table.horizontalHeader().setSectionResizeMode(5, QtWidgets.QHeaderView.Stretch)
+        self.hosts_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+        self.hosts_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.hosts_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+
+        self.config_label = QtWidgets.QLabel(f"Startup config: {self.config_path}")
+        self.config_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.reload_config_btn = QtWidgets.QPushButton("Reload config")
+        self.refresh_nodes_btn = QtWidgets.QPushButton("Refresh nodes")
+        self.ping_all_btn = QtWidgets.QPushButton("Ping all")
+        self.ssh_test_btn = QtWidgets.QPushButton("SSH test selected")
+        self.launch_camera_btn = QtWidgets.QPushButton("Launch Camera")
+        self.shutdown_camera_btn = QtWidgets.QPushButton("Shutdown Camera")
+        self.launch_triggerbox_btn = QtWidgets.QPushButton("Launch Triggerbox")
+        self.shutdown_triggerbox_btn = QtWidgets.QPushButton("Shutdown Triggerbox")
+
+        top_group = QtWidgets.QGroupBox("ROS2 nodes on domain")
+        top_layout = QtWidgets.QVBoxLayout()
+        top_layout.addWidget(self.nodes_table)
+        top_group.setLayout(top_layout)
+
+        mid_group = QtWidgets.QGroupBox("Computers")
+        mid_layout = QtWidgets.QVBoxLayout()
+        mid_layout.addWidget(self.config_label)
+        mid_layout.addWidget(self.hosts_table)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(self.reload_config_btn)
+        row.addWidget(self.ping_all_btn)
+        row.addWidget(self.ssh_test_btn)
+        row.addWidget(self.refresh_nodes_btn)
+        row.addStretch(1)
+        mid_layout.addLayout(row)
+        mid_group.setLayout(mid_layout)
+
+        button_group = QtWidgets.QGroupBox("Selected computer actions")
+        button_layout = QtWidgets.QGridLayout()
+        button_layout.addWidget(self.launch_camera_btn, 0, 0)
+        button_layout.addWidget(self.shutdown_camera_btn, 0, 1)
+        button_layout.addWidget(self.launch_triggerbox_btn, 1, 0)
+        button_layout.addWidget(self.shutdown_triggerbox_btn, 1, 1)
+        button_group.setLayout(button_layout)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(top_group, stretch=2)
+        layout.addWidget(mid_group, stretch=2)
+        layout.addWidget(button_group, stretch=0)
+        self.setLayout(layout)
+
+        self.reload_config_btn.clicked.connect(self.reload_config)
+        self.refresh_nodes_btn.clicked.connect(self.refresh_nodes)
+        self.ping_all_btn.clicked.connect(self.ping_all)
+        self.ssh_test_btn.clicked.connect(self.ssh_test_selected)
+        self.launch_camera_btn.clicked.connect(self.launch_camera)
+        self.shutdown_camera_btn.clicked.connect(lambda: self.shutdown_node("camera"))
+        self.launch_triggerbox_btn.clicked.connect(self.launch_triggerbox)
+        self.shutdown_triggerbox_btn.clicked.connect(lambda: self.shutdown_node("triggerbox"))
+
+        self.populate_hosts()
+        self.refresh_nodes()
+        self.refresh_timer = QtCore.QTimer(self)
+        self.refresh_timer.setInterval(2000)
+        self.refresh_timer.timeout.connect(self.refresh_nodes)
+        self.refresh_timer.start()
+
+    def reload_config(self):
+        self.config = load_startup_config(self.config_path)
+        self.populate_hosts()
+        self.log(f"Startup config reloaded from {self.config_path}")
+
+    def populate_hosts(self):
+        self.hosts_table.setRowCount(0)
+        for host in self.config.hosts:
+            row = self.hosts_table.rowCount()
+            self.hosts_table.insertRow(row)
+            vals = [host.label, host.hostname, host.ip, "local" if host.is_local else "?", "local" if host.is_local else "?", host.notes]
+            for col, val in enumerate(vals):
+                self.hosts_table.setItem(row, col, QtWidgets.QTableWidgetItem(str(val)))
+        if self.hosts_table.rowCount() > 0:
+            self.hosts_table.selectRow(0)
+
+    def selected_host(self) -> Optional[StartupHost]:
+        rows = self.hosts_table.selectionModel().selectedRows()
+        if not rows:
+            QtWidgets.QMessageBox.information(self, "No host selected", "Select one computer first.")
+            return None
+        idx = rows[0].row()
+        if idx < 0 or idx >= len(self.config.hosts):
+            return None
+        return self.config.hosts[idx]
+
+    def set_host_status(self, host: StartupHost, column_name: str, text: str):
+        col = {"ping": 3, "ssh": 4}.get(column_name)
+        if col is None:
+            return
+        for row, h in enumerate(self.config.hosts):
+            if h is host:
+                item = self.hosts_table.item(row, col)
+                if item:
+                    item.setText(text)
+                return
+
+    def _node_type(self, full: str, service_types: Dict[str, List[str]]) -> str:
+        if "cambuffer_recorder_ng/srv/GetStatus" in service_types.get(f"{full}/get_status", []):
+            return "camera"
+        low = full.lower()
+        if "trigger" in low:
+            return "triggerbox"
+        if "camera_control" in low:
+            return "gui"
+        return "unknown"
+
+    def refresh_nodes(self):
+        service_types = {name: types for name, types in self.ros.get_service_names_and_types()}
+        rows = []
+        own_full = full_node_name(self.ros.get_name(), self.ros.get_namespace())
+        for name, ns in self.ros.get_node_names_and_namespaces():
+            full = full_node_name(name, ns)
+            ntype = self._node_type(full, service_types)
+            host = self.node_host_map.get(full, "local" if full == own_full else "unknown")
+            status = "visible"
+            if ntype == "camera" and f"{full}/get_status" in service_types:
+                status = "CBRNG status service visible"
+            rows.append((full, ntype, host, status))
+        rows.sort(key=lambda r: (r[1], r[0]))
+        self.nodes_table.setRowCount(0)
+        for vals in rows:
+            row = self.nodes_table.rowCount()
+            self.nodes_table.insertRow(row)
+            for col, val in enumerate(vals):
+                self.nodes_table.setItem(row, col, QtWidgets.QTableWidgetItem(str(val)))
+
+    def ping_all(self):
+        for host in self.config.hosts:
+            self.ping_host(host)
+
+    def ping_host(self, host: StartupHost):
+        if host.is_local:
+            self.set_host_status(host, "ping", "ok")
+            return
+        proc = QtCore.QProcess(self)
+        proc.setProgram("ping")
+        proc.setArguments(["-c", "1", "-W", "1", host.ip])
+        proc.finished.connect(lambda code, status, h=host, p=proc: self._ping_finished(h, p, code))
+        proc.start()
+
+    def _ping_finished(self, host: StartupHost, proc: QtCore.QProcess, code: int):
+        ok = code == 0
+        self.set_host_status(host, "ping", "ok" if ok else "fail")
+        self.log(f"ping {host.label} ({host.ip}): {'ok' if ok else 'fail'}")
+        proc.deleteLater()
+
+    def ssh_test_selected(self):
+        host = self.selected_host()
+        if host is None:
+            return
+        if host.is_local:
+            self.set_host_status(host, "ssh", "local")
+            self.log("SSH test local: ok")
+            return
+        proc = QtCore.QProcess(self)
+        proc.setProgram("ssh")
+        proc.setArguments(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", host.ssh_target(), "hostname && echo SSH_OK"])
+        proc.finished.connect(lambda code, status, h=host, p=proc: self._ssh_finished(h, p, code))
+        proc.start()
+
+    def _ssh_finished(self, host: StartupHost, proc: QtCore.QProcess, code: int):
+        out = bytes(proc.readAllStandardOutput()).decode(errors="replace").strip()
+        err = bytes(proc.readAllStandardError()).decode(errors="replace").strip()
+        ok = code == 0 and "SSH_OK" in out
+        self.set_host_status(host, "ssh", "ok" if ok else "fail")
+        self.log(f"ssh test {host.label}: {'ok' if ok else 'fail'} {out} {err}".strip())
+        proc.deleteLater()
+
+    def _start_process(self, key: str, host: StartupHost, shell_cmd: str, long_running: bool = True):
+        if key in self.processes and self.processes[key].state() != QtCore.QProcess.NotRunning:
+            QtWidgets.QMessageBox.information(self, "Already running", f"A process for {key} is already running from this GUI.")
+            return
+        proc = QtCore.QProcess(self)
+        if host.is_local:
+            proc.setProgram("bash")
+            proc.setArguments(["-lc", shell_cmd])
+        else:
+            remote = f"bash -lc {shlex.quote(shell_cmd)}"
+            proc.setProgram("ssh")
+            proc.setArguments([host.ssh_target(), remote])
+        proc.readyReadStandardOutput.connect(lambda p=proc, k=key: self._read_proc_output(k, p, False))
+        proc.readyReadStandardError.connect(lambda p=proc, k=key: self._read_proc_output(k, p, True))
+        proc.finished.connect(lambda code, status, k=key, p=proc: self._process_finished(k, p, code, status))
+        self.processes[key] = proc
+        self.log(f"launch {key} on {host.label}: {shell_cmd}")
+        proc.start()
+
+    def _run_short_command(self, key: str, host: StartupHost, shell_cmd: str):
+        proc = QtCore.QProcess(self)
+        if host.is_local:
+            proc.setProgram("bash")
+            proc.setArguments(["-lc", shell_cmd])
+        else:
+            proc.setProgram("ssh")
+            proc.setArguments([host.ssh_target(), f"bash -lc {shlex.quote(shell_cmd)}"])
+        proc.readyReadStandardOutput.connect(lambda p=proc, k=key: self._read_proc_output(k, p, False))
+        proc.readyReadStandardError.connect(lambda p=proc, k=key: self._read_proc_output(k, p, True))
+        proc.finished.connect(lambda code, status, k=key, p=proc: self._short_finished(k, p, code))
+        self.log(f"run {key} on {host.label}: {shell_cmd}")
+        proc.start()
+
+    def _read_proc_output(self, key: str, proc: QtCore.QProcess, is_err: bool):
+        data = proc.readAllStandardError() if is_err else proc.readAllStandardOutput()
+        text = bytes(data).decode(errors="replace").strip()
+        if not text:
+            return
+        prefix = "stderr" if is_err else "stdout"
+        for line in text.splitlines():
+            self.log(f"{key} {prefix}: {line}")
+
+    def _process_finished(self, key: str, proc: QtCore.QProcess, code: int, status):
+        self.log(f"process {key} finished with code {code}")
+        proc.deleteLater()
+
+    def _short_finished(self, key: str, proc: QtCore.QProcess, code: int):
+        self.log(f"command {key} finished with code {code}")
+        proc.deleteLater()
+        QtCore.QTimer.singleShot(500, self.refresh_nodes)
+
+    def launch_camera(self):
+        host = self.selected_host()
+        if host is None:
+            return
+        dlg = LaunchCameraDialog(host, self.config.camera_profiles, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        node, cmd = dlg.command(host)
+        full = f"/{node}"
+        self.node_host_map[full] = f"{host.label}/{host.ip}"
+        self._start_process(f"camera:{host.label}:{node}", host, cmd, long_running=True)
+        QtCore.QTimer.singleShot(1500, self.refresh_nodes)
+
+    def launch_triggerbox(self):
+        host = self.selected_host()
+        if host is None:
+            return
+        dlg = LaunchTriggerboxDialog(host, self.config.triggerbox_profiles, self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        node, cmd = dlg.command(host)
+        full = f"/{node}"
+        self.node_host_map[full] = f"{host.label}/{host.ip}"
+        self._start_process(f"triggerbox:{host.label}:{node}", host, cmd, long_running=True)
+        QtCore.QTimer.singleShot(1500, self.refresh_nodes)
+
+    def shutdown_node(self, node_kind: str):
+        host = self.selected_host()
+        if host is None:
+            return
+        default_node = host.default_camera_node if node_kind == "camera" else host.default_triggerbox_node
+        node, ok = QtWidgets.QInputDialog.getText(self, f"Shutdown {node_kind}", "Node name", text=default_node)
+        if not ok:
+            return
+        node = safe_token(node, default_node)
+        key_prefix = f"{node_kind}:{host.label}:{node}"
+        proc = self.processes.get(key_prefix)
+        if proc is not None and proc.state() != QtCore.QProcess.NotRunning:
+            self.log(f"terminating GUI-launched process {key_prefix}")
+            proc.terminate()
+        # Also ask ROS lifecycle nicely, then use a narrow pkill fallback for dev convenience.
+        setup = f"source /opt/ros/{shlex.quote(host.ros_distro)}/setup.bash && source {shlex.quote(host.workspace)}/install/setup.bash"
+        if node_kind == "camera":
+            pattern = f"cambuffer_recorder_ng.*__node:={node}"
+        else:
+            pattern = f"triggerbox.*__node:={node}"
+        cmd = (
+            f"{setup} && "
+            f"(ros2 lifecycle set /{shlex.quote(node)} shutdown || true); "
+            f"sleep 0.5; "
+            f"(pkill -f {shlex.quote(pattern)} || true)"
+        )
+        self._run_short_command(f"shutdown:{node_kind}:{host.label}:{node}", host, cmd)
+
+
 # --------------------------
 # Main window
 # --------------------------
@@ -1168,7 +1695,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, ros: CameraControlRos):
         super().__init__()
         self.ros = ros
-        self.setWindowTitle("camera_control: cameras + metadata")
+        self.setWindowTitle("camera_control: cameras + metadata + startup/shutdown")
         # Let Qt choose a natural initial size; avoid unnecessary scrollbars.
 
         self.metadata_panel = MetadataPanel()
@@ -1220,6 +1747,9 @@ class MainWindow(QtWidgets.QMainWindow):
         meta_layout.addStretch(1)
         tab_meta.setLayout(meta_layout)
         self.tabs.addTab(tab_meta, "Metadata")
+
+        self.startup_panel = StartupShutdownPanel(self.ros, self.append_log)
+        self.tabs.addTab(self.startup_panel, "Startup/Shutdown")
 
         tab_preview = QtWidgets.QWidget()
         preview_layout = QtWidgets.QVBoxLayout()
