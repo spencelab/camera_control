@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import getpass
+import shlex
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -511,6 +512,76 @@ class MetadataSummary(QtWidgets.QFrame):
         self.label.setText(
             f"Session: {animal} | {timepoint} | {trial} | {speed} | {condition} | {status}"
         )
+
+class SystemPanel(QtWidgets.QGroupBox):
+    def __init__(self, process_manager: RosProcessManager, camera_panel: CameraPanel):
+        super().__init__("System Bring-Up")
+        self.pm = process_manager
+        self.camera_panel = camera_panel
+
+        self.auto_btn = QtWidgets.QPushButton("Auto-initiate system")
+        self.configure_btn = QtWidgets.QPushButton("Configure cameras")
+        self.enable_trigger_btn = QtWidgets.QPushButton("Enable trigger output")
+        self.disable_trigger_btn = QtWidgets.QPushButton("Disable trigger output")
+        self.stop_processes_btn = QtWidgets.QPushButton("Stop launched processes")
+
+        layout = QtWidgets.QHBoxLayout()
+        layout.addWidget(self.auto_btn)
+        layout.addWidget(self.configure_btn)
+        layout.addWidget(self.enable_trigger_btn)
+        layout.addWidget(self.disable_trigger_btn)
+        layout.addWidget(self.stop_processes_btn)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+        self.auto_btn.clicked.connect(self.auto_initiate)
+        self.configure_btn.clicked.connect(self.configure_cameras)
+        self.enable_trigger_btn.clicked.connect(self.enable_trigger_output)
+        self.disable_trigger_btn.clicked.connect(self.disable_trigger_output)
+        self.stop_processes_btn.clicked.connect(self.pm.stop_all)
+
+    def auto_initiate(self):
+        self.pm.launch(
+            "triggerbox_host",
+            "ros2 run triggerbox_ros2 triggerbox_host"
+        )
+
+        self.pm.launch(
+            "cam1",
+            "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng "
+            "--ros-args "
+            "-r __node:=cam1 "
+            "--params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+        )
+
+        self.pm.launch(
+            "cam2",
+            "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng "
+            "--ros-args "
+            "-r __node:=cam2 "
+            "--params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml"
+        )
+
+        QtCore.QTimer.singleShot(4000, self.configure_cameras)
+        QtCore.QTimer.singleShot(6000, self.camera_panel.discover)
+
+    def configure_cameras(self):
+        self.pm.run_once("configure_cam1", "ros2 lifecycle set /cam1 configure")
+        self.pm.run_once("configure_cam2", "ros2 lifecycle set /cam2 configure")
+        QtCore.QTimer.singleShot(1500, self.camera_panel.discover)
+
+    def enable_trigger_output(self):
+        self.pm.run_once(
+            "enable_trigger_output",
+            'ros2 service call /triggerbox_host/enable_output std_srvs/srv/Trigger "{}"'
+        )
+
+    def disable_trigger_output(self):
+        self.pm.run_once(
+            "disable_trigger_output",
+            'ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}"'
+        )
+
 
 
 # --------------------------
@@ -1160,6 +1231,85 @@ class CameraPanel(QtWidgets.QGroupBox):
         else:
             print(msg)
 
+class RosProcessManager(QtCore.QObject):
+    log_line = QtCore.Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.processes: Dict[str, QtCore.QProcess] = {}
+
+    def launch(self, name: str, command: str):
+        if name in self.processes:
+            proc = self.processes[name]
+            if proc.state() != QtCore.QProcess.NotRunning:
+                self.log_line.emit(f"{name} is already running")
+                return
+
+        proc = QtCore.QProcess(self)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+
+        proc.readyReadStandardOutput.connect(
+            lambda name=name, proc=proc: self._read_output(name, proc)
+        )
+        proc.finished.connect(
+            lambda code, status, name=name: self.log_line.emit(
+                f"{name} exited with code {code}, status={status}"
+            )
+        )
+
+        self.processes[name] = proc
+
+        full_cmd = (
+            "source /opt/ros/jazzy/setup.bash && "
+            "source ~/ros2_ws/install/setup.bash && "
+            f"{command}"
+        )
+
+        self.log_line.emit(f"Launching {name}: {command}")
+        proc.start("bash", ["-lc", full_cmd])
+
+    def run_once(self, name: str, command: str):
+        proc = QtCore.QProcess(self)
+        proc.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+
+        proc.readyReadStandardOutput.connect(
+            lambda name=name, proc=proc: self._read_output(name, proc)
+        )
+        proc.finished.connect(
+            lambda code, status, name=name: self.log_line.emit(
+                f"{name} finished with code {code}, status={status}"
+            )
+        )
+
+        full_cmd = (
+            "source /opt/ros/jazzy/setup.bash && "
+            "source ~/ros2_ws/install/setup.bash && "
+            f"{command}"
+        )
+
+        self.log_line.emit(f"Running {name}: {command}")
+        proc.start("bash", ["-lc", full_cmd])
+
+    def stop_all(self):
+        for name, proc in self.processes.items():
+            if proc.state() != QtCore.QProcess.NotRunning:
+                self.log_line.emit(f"Stopping {name}")
+                proc.terminate()
+
+        QtCore.QTimer.singleShot(2000, self.kill_remaining)
+
+    def kill_remaining(self):
+        for name, proc in self.processes.items():
+            if proc.state() != QtCore.QProcess.NotRunning:
+                self.log_line.emit(f"Killing {name}")
+                proc.kill()
+
+    def _read_output(self, name: str, proc: QtCore.QProcess):
+        data = bytes(proc.readAllStandardOutput()).decode(errors="replace")
+        for line in data.splitlines():
+            if line.strip():
+                self.log_line.emit(f"{name}: {line.strip()}")
+
 
 # --------------------------
 # Main window
@@ -1175,6 +1325,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.metadata_summary = MetadataSummary(self.metadata_panel)
         self.camera_panel = CameraPanel(ros, self.metadata_panel)
         self.ros.set_event_callback(self.append_log)
+
+        self.process_manager = RosProcessManager(self)
+        self.process_manager.log_line.connect(self.append_log)
+        self.system_panel = SystemPanel(self.process_manager, self.camera_panel)
 
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
@@ -1193,6 +1347,7 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_camera = QtWidgets.QWidget()
         cam_layout = QtWidgets.QVBoxLayout()
         cam_layout.setContentsMargins(6, 6, 6, 6)
+        cam_layout.addWidget(self.system_panel)
         cam_layout.addWidget(self.metadata_summary)
         cam_layout.addWidget(self.camera_panel, stretch=1)
 
