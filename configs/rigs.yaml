@@ -1,0 +1,94 @@
+# camera_control rig presets
+#
+# Installed location:
+#   camera_control/configs/rigs.yaml
+#
+# Override for testing:
+#   export CAMERA_CONTROL_RIGS_YAML=/path/to/rigs.yaml
+#
+# Commands below intentionally preserve the original launch style:
+# the GUI wraps each command with:
+#   source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && ...
+
+rigs:
+  - key: gavin_vm_barebones_2cams_tbox
+    label: gavin_vm_barebones_2cams_tbox
+    description: "Original barebones launcher: local triggerbox_host plus local cam1/cam2."
+    has_triggerbox: true
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1, cam2]
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host"
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+      - name: cam2
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml"
+    shutdown_commands:
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+      - name: shutdown_cam2
+        command: "timeout 10s ros2 lifecycle set /cam2 shutdown || true"
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
+
+  - key: camdev_local_1cam
+    label: camdev_local_1cam
+    description: "Camdev only: launch local cam1. No triggerbox host."
+    has_triggerbox: false
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1]
+    processes:
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+    shutdown_commands:
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+
+  - key: camdev_local_1cam_tbox
+    label: camdev_local_1cam_tbox
+    description: "Camdev only: local triggerbox_host plus local cam1."
+    has_triggerbox: true
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1]
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host /dev/trig2"
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+    shutdown_commands:
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
+
+  - key: maincampus_camdev_2cams_tbox
+    label: maincampus_camdev_2cams_tbox
+    description: "Main campus rig: local triggerbox_host, local cam1, remote cam2 on 10.0.0.2 as spencelab."
+    has_triggerbox: true
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1, cam2]
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host /dev/trig2"
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+      - name: cam2@10.0.0.2
+        command: "ssh -t spencelab@10.0.0.2 'ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml'"
+    shutdown_commands:
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+      - name: shutdown_cam2@10.0.0.2
+        command: "ssh -T spencelab@10.0.0.2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam2 shutdown || true'"
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"

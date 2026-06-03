@@ -445,7 +445,7 @@ class MetadataPanel(QtWidgets.QGroupBox):
             return False
         path = md.write_session_yaml()
         self.confirmed = True
-        self.status_label.setText(f"Confirmed → {path.parent.name}")
+        self.status_label.setText(f"Confirmed ? {path.parent.name}")
         self.metadata_changed.emit()
         return True
 
@@ -469,7 +469,7 @@ class MetadataPanel(QtWidgets.QGroupBox):
             if clicked is use:
                 md.write_session_yaml()
                 self.confirmed = True
-                self.status_label.setText(f"Confirmed → {md.session_dir().name}")
+                self.status_label.setText(f"Confirmed ? {md.session_dir().name}")
                 self.metadata_changed.emit()
         return self.current_metadata()
 
@@ -508,75 +508,391 @@ class MetadataSummary(QtWidgets.QFrame):
         trial = md.trial_id or "trial?"
         speed = f"{md.speed_cm_s} cm/s" if md.speed_cm_s else "speed?"
         condition = md.condition or "condition?"
-        status = "confirmed ✅" if self.metadata_panel.confirmed else "not confirmed"
+        status = "confirmed ?" if self.metadata_panel.confirmed else "not confirmed"
         self.label.setText(
             f"Session: {animal} | {timepoint} | {trial} | {speed} | {condition} | {status}"
         )
+
+
+
+# --------------------------
+# Rig preset loading
+# --------------------------
+def default_rigs_yaml_path() -> Path:
+    # Preferred repo layout: camera_control/configs/rigs.yaml.
+    # Keep camera_control/config/rigs.yaml as a fallback for older patches.
+    repo_root = Path(__file__).resolve().parents[1]
+    preferred = repo_root / "configs" / "rigs.yaml"
+    if preferred.exists():
+        return preferred
+    return repo_root / "config" / "rigs.yaml"
+
+
+def _string_command(command: Any) -> str:
+    """Accept either a shell command string or a YAML list of argv tokens."""
+    if isinstance(command, str):
+        return command
+    if isinstance(command, (list, tuple)):
+        return " ".join(shlex.quote(str(x)) for x in command)
+    return str(command)
+
+
+@dataclass(frozen=True)
+class RigProcessSpec:
+    name: str
+    command: str
+
+
+@dataclass(frozen=True)
+class RigCommandSpec:
+    name: str
+    command: str
+
+
+@dataclass(frozen=True)
+class RigPreset:
+    key: str
+    label: str
+    description: str
+    processes: Tuple[RigProcessSpec, ...]
+    camera_nodes: Tuple[str, ...]
+    has_triggerbox: bool = False
+    configure_delay_ms: int = 4000
+    discover_delay_ms: int = 6000
+    shutdown_commands: Tuple[RigCommandSpec, ...] = ()
+
+
+CAMERA_NODE_CMD = (
+    "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng "
+    "--ros-args -r __node:={node} "
+    "--params-file {params_file}"
+)
+
+
+def local_camera_process(node: str, params_file: str) -> RigProcessSpec:
+    return RigProcessSpec(
+        node,
+        CAMERA_NODE_CMD.format(node=node, params_file=params_file),
+    )
+
+
+def ssh_camera_process(host: str, user: str, node: str, params_file: str) -> RigProcessSpec:
+    remote_cmd = CAMERA_NODE_CMD.format(node=node, params_file=params_file)
+    return RigProcessSpec(
+        f"{node}@{host}",
+        f"ssh -t {shlex.quote(user + '@' + host)} {shlex.quote(remote_cmd)}",
+    )
+
+
+def lifecycle_shutdown_command(node: str) -> RigCommandSpec:
+    # timeout prevents a wedged lifecycle command from trapping the GUI forever.
+    return RigCommandSpec(
+        f"shutdown_{node}",
+        f"timeout 10s ros2 lifecycle set /{node} shutdown || true",
+    )
+
+
+def ssh_lifecycle_shutdown_command(host: str, user: str, node: str) -> RigCommandSpec:
+    remote_cmd = (
+        "source /opt/ros/jazzy/setup.bash && "
+        "source ~/ros2_ws/install/setup.bash && "
+        f"timeout 10s ros2 lifecycle set /{node} shutdown || true"
+    )
+    return RigCommandSpec(
+        f"shutdown_{node}@{host}",
+        f"ssh -T {shlex.quote(user + '@' + host)} {shlex.quote(remote_cmd)}",
+    )
+
+
+CAM1_HW_CONFIG = "~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+CAM2_HW_CONFIG = "~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml"
+TRIGGERBOX_CMD = "ros2 run triggerbox_ros2 triggerbox_host"
+
+
+DEFAULT_RIG_PRESETS: Tuple[RigPreset, ...] = (
+    RigPreset(
+        key="gavin_vm_barebones_2cams_tbox",
+        label="gavin_vm_barebones_2cams_tbox",
+        description="Original barebones launcher: local triggerbox_host plus local cam1/cam2.",
+        processes=(
+            RigProcessSpec("triggerbox_host", TRIGGERBOX_CMD),
+            local_camera_process("cam1", CAM1_HW_CONFIG),
+            local_camera_process("cam2", CAM2_HW_CONFIG),
+        ),
+        camera_nodes=("cam1", "cam2"),
+        has_triggerbox=True,
+        shutdown_commands=(
+            lifecycle_shutdown_command("cam1"),
+            lifecycle_shutdown_command("cam2"),
+        ),
+    ),
+    RigPreset(
+        key="camdev_local_1cam",
+        label="camdev_local_1cam",
+        description="Camdev only: launch local cam1. No triggerbox host.",
+        processes=(
+            local_camera_process("cam1", CAM1_HW_CONFIG),
+        ),
+        camera_nodes=("cam1",),
+        has_triggerbox=False,
+        shutdown_commands=(
+            lifecycle_shutdown_command("cam1"),
+        ),
+    ),
+    RigPreset(
+        key="camdev_local_1cam_tbox",
+        label="camdev_local_1cam_tbox",
+        description="Camdev only: local triggerbox_host plus local cam1.",
+        processes=(
+            RigProcessSpec("triggerbox_host", TRIGGERBOX_CMD),
+            local_camera_process("cam1", CAM1_HW_CONFIG),
+        ),
+        camera_nodes=("cam1",),
+        has_triggerbox=True,
+        shutdown_commands=(
+            lifecycle_shutdown_command("cam1"),
+        ),
+    ),
+    RigPreset(
+        key="maincampus_camdev_2cams_tbox",
+        label="maincampus_camdev_2cams_tbox",
+        description="Main campus rig: local triggerbox_host, local cam1, remote cam2 on 10.0.0.2 as spencelab.",
+        processes=(
+            RigProcessSpec("triggerbox_host", TRIGGERBOX_CMD),
+            local_camera_process("cam1", CAM1_HW_CONFIG),
+            ssh_camera_process("10.0.0.2", "spencelab", "cam2", CAM2_HW_CONFIG),
+        ),
+        camera_nodes=("cam1", "cam2"),
+        has_triggerbox=True,
+        shutdown_commands=(
+            lifecycle_shutdown_command("cam1"),
+            ssh_lifecycle_shutdown_command("10.0.0.2", "spencelab", "cam2"),
+        ),
+    ),
+)
+
+
+def _rig_from_dict(item: Dict[str, Any]) -> RigPreset:
+    key = str(item.get("key") or item.get("label") or "").strip()
+    if not key:
+        raise ValueError("rig entry missing required 'key'")
+
+    label = str(item.get("label") or key)
+    description = str(item.get("description") or "")
+
+    processes_in = item.get("processes") or []
+    processes: List[RigProcessSpec] = []
+    for proc in processes_in:
+        if not isinstance(proc, dict):
+            raise ValueError(f"rig {key}: each process must be a mapping")
+        name = str(proc.get("name") or "").strip()
+        command = proc.get("command")
+        if not name or command is None:
+            raise ValueError(f"rig {key}: process missing name or command")
+        processes.append(RigProcessSpec(name, _string_command(command)))
+
+    camera_nodes = tuple(str(x).strip().lstrip("/") for x in (item.get("camera_nodes") or []) if str(x).strip())
+    has_triggerbox = bool(item.get("has_triggerbox", any(p.name == "triggerbox_host" for p in processes)))
+    configure_delay_ms = int(item.get("configure_delay_ms", 4000))
+    discover_delay_ms = int(item.get("discover_delay_ms", 6000))
+
+    shutdown_in = item.get("shutdown_commands") or []
+    shutdown_commands: List[RigCommandSpec] = []
+    for cmd in shutdown_in:
+        if not isinstance(cmd, dict):
+            raise ValueError(f"rig {key}: each shutdown command must be a mapping")
+        name = str(cmd.get("name") or "").strip()
+        command = cmd.get("command")
+        if not name or command is None:
+            raise ValueError(f"rig {key}: shutdown command missing name or command")
+        shutdown_commands.append(RigCommandSpec(name, _string_command(command)))
+
+    return RigPreset(
+        key=key,
+        label=label,
+        description=description,
+        processes=tuple(processes),
+        camera_nodes=camera_nodes,
+        has_triggerbox=has_triggerbox,
+        configure_delay_ms=configure_delay_ms,
+        discover_delay_ms=discover_delay_ms,
+        shutdown_commands=tuple(shutdown_commands),
+    )
+
+
+def load_rig_presets() -> Tuple[RigPreset, ...]:
+    path = Path(os.environ.get("CAMERA_CONTROL_RIGS_YAML", default_rigs_yaml_path())).expanduser()
+    if not path.exists():
+        return DEFAULT_RIG_PRESETS
+
+    try:
+        import yaml  # type: ignore
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        rigs_in = data.get("rigs", data if isinstance(data, list) else [])
+        rigs = tuple(_rig_from_dict(item) for item in rigs_in)
+        return rigs or DEFAULT_RIG_PRESETS
+    except Exception as e:
+        print(f"WARNING: failed to load rigs YAML from {path}: {e}", file=sys.stderr)
+        print("WARNING: falling back to built-in rig presets", file=sys.stderr)
+        return DEFAULT_RIG_PRESETS
+
+
+RIG_PRESETS: Tuple[RigPreset, ...] = load_rig_presets()
+
+
+def rig_by_key(key: str) -> RigPreset:
+    for rig in RIG_PRESETS:
+        if rig.key == key:
+            return rig
+    return RIG_PRESETS[0]
+
+
+class RigSelectDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Launch system")
+        self.setModal(True)
+        self.settings = QtCore.QSettings("SpenceLab", "camera_control")
+
+        self.rig_combo = QtWidgets.QComboBox()
+        for rig in RIG_PRESETS:
+            self.rig_combo.addItem(rig.label, rig.key)
+
+        default_key = self.settings.value("launch/default_rig", RIG_PRESETS[0].key)
+        for i in range(self.rig_combo.count()):
+            if self.rig_combo.itemData(i) == default_key:
+                self.rig_combo.setCurrentIndex(i)
+                break
+
+        self.description = QtWidgets.QLabel()
+        self.description.setWordWrap(True)
+        self.description.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+
+        self.remember_default = QtWidgets.QCheckBox("Remember this rig as default")
+        self.remember_default.setChecked(True)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Launch")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QtWidgets.QVBoxLayout()
+        form = QtWidgets.QFormLayout()
+        form.addRow("Rig", self.rig_combo)
+        layout.addLayout(form)
+        layout.addWidget(self.description)
+        layout.addWidget(self.remember_default)
+        layout.addWidget(buttons)
+        self.setLayout(layout)
+
+        self.rig_combo.currentIndexChanged.connect(self.update_description)
+        self.update_description()
+
+    def selected_rig(self) -> RigPreset:
+        return rig_by_key(str(self.rig_combo.currentData()))
+
+    def update_description(self):
+        rig = self.selected_rig()
+        nodes = ", ".join(rig.camera_nodes) if rig.camera_nodes else "none"
+        tbox = "yes" if rig.has_triggerbox else "no"
+        self.description.setText(
+            f"{rig.description}\n\nCamera nodes: {nodes}\nTriggerbox: {tbox}"
+        )
+
+    def accept(self):
+        if self.remember_default.isChecked():
+            self.settings.setValue("launch/default_rig", self.selected_rig().key)
+        super().accept()
 
 class SystemPanel(QtWidgets.QGroupBox):
     def __init__(self, process_manager: RosProcessManager, camera_panel: CameraPanel):
         super().__init__("System Bring-Up")
         self.pm = process_manager
         self.camera_panel = camera_panel
+        self.active_rig: RigPreset = rig_by_key(
+            str(QtCore.QSettings("SpenceLab", "camera_control").value("launch/default_rig", RIG_PRESETS[0].key))
+        )
 
-        self.auto_btn = QtWidgets.QPushButton("Auto-initiate system")
+        self.launch_btn = QtWidgets.QPushButton("Launch system")
         self.configure_btn = QtWidgets.QPushButton("Configure cameras")
         self.enable_trigger_btn = QtWidgets.QPushButton("Enable trigger output")
         self.disable_trigger_btn = QtWidgets.QPushButton("Disable trigger output")
-        self.stop_processes_btn = QtWidgets.QPushButton("Stop launched processes")
+        self.stop_processes_btn = QtWidgets.QPushButton("Shutdown system")
+        self.active_rig_label = QtWidgets.QLabel(f"Rig: {self.active_rig.label}")
+        self.active_rig_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
         layout = QtWidgets.QHBoxLayout()
-        layout.addWidget(self.auto_btn)
+        layout.addWidget(self.launch_btn)
         layout.addWidget(self.configure_btn)
         layout.addWidget(self.enable_trigger_btn)
         layout.addWidget(self.disable_trigger_btn)
         layout.addWidget(self.stop_processes_btn)
+        layout.addWidget(self.active_rig_label)
         layout.addStretch(1)
         self.setLayout(layout)
 
-        self.auto_btn.clicked.connect(self.auto_initiate)
+        self.launch_btn.clicked.connect(self.launch_system)
         self.configure_btn.clicked.connect(self.configure_cameras)
         self.enable_trigger_btn.clicked.connect(self.enable_trigger_output)
         self.disable_trigger_btn.clicked.connect(self.disable_trigger_output)
-        self.stop_processes_btn.clicked.connect(self.pm.stop_all)
+        self.stop_processes_btn.clicked.connect(self.shutdown_system)
 
-    def auto_initiate(self):
-        self.pm.launch(
-            "triggerbox_host",
-            "ros2 run triggerbox_ros2 triggerbox_host"
-        )
+    def launch_system(self):
+        dlg = RigSelectDialog(self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        self.active_rig = dlg.selected_rig()
+        self.active_rig_label.setText(f"Rig: {self.active_rig.label}")
 
-        self.pm.launch(
-            "cam1",
-            "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng "
-            "--ros-args "
-            "-r __node:=cam1 "
-            "--params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
-        )
+        for spec in self.active_rig.processes:
+            self.pm.launch(spec.name, spec.command)
 
-        self.pm.launch(
-            "cam2",
-            "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng "
-            "--ros-args "
-            "-r __node:=cam2 "
-            "--params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml"
-        )
-
-        QtCore.QTimer.singleShot(4000, self.configure_cameras)
-        QtCore.QTimer.singleShot(6000, self.camera_panel.discover)
+        QtCore.QTimer.singleShot(self.active_rig.configure_delay_ms, self.configure_cameras)
+        QtCore.QTimer.singleShot(self.active_rig.discover_delay_ms, self.camera_panel.discover)
 
     def configure_cameras(self):
-        self.pm.run_once("configure_cam1", "ros2 lifecycle set /cam1 configure")
-        self.pm.run_once("configure_cam2", "ros2 lifecycle set /cam2 configure")
+        for node in self.active_rig.camera_nodes:
+            self.pm.run_once(f"configure_{node}", f"ros2 lifecycle set /{node} configure")
         QtCore.QTimer.singleShot(1500, self.camera_panel.discover)
 
+    def shutdown_system(self):
+        # Prefer the rig-defined shutdown sequence when present. This lets
+        # rigs.yaml own non-lifecycle helpers such as triggerbox_host, including
+        # targeted pkill fallbacks when QProcess cannot reap the underlying ROS
+        # Python process.
+        if self.active_rig.shutdown_commands:
+            for spec in self.active_rig.shutdown_commands:
+                self.pm.run_once(spec.name, spec.command)
+            QtCore.QTimer.singleShot(12000, self.pm.stop_all)
+        else:
+            # Legacy fallback for built-in/minimal rigs without YAML shutdown
+            # commands: disable trigger output, stop triggerbox shortly after,
+            # then clean up any remaining launched processes.
+            if self.active_rig.has_triggerbox:
+                self.disable_trigger_output()
+                for name in self._triggerbox_process_names():
+                    QtCore.QTimer.singleShot(2500, lambda name=name: self.pm.stop(name))
+            QtCore.QTimer.singleShot(2500 if self.active_rig.has_triggerbox else 0, self.pm.stop_all)
+        QtCore.QTimer.singleShot(5000, self.camera_panel.discover)
+
+    def _triggerbox_process_names(self) -> List[str]:
+        return [spec.name for spec in self.active_rig.processes if "triggerbox" in spec.name.lower()]
+
     def enable_trigger_output(self):
+        if not self.active_rig.has_triggerbox:
+            self.pm.log_line.emit(f"Rig {self.active_rig.label} has no triggerbox_host preset")
+            return
         self.pm.run_once(
             "enable_trigger_output",
             'ros2 service call /triggerbox_host/enable_output std_srvs/srv/Trigger "{}"'
         )
 
     def disable_trigger_output(self):
+        if not self.active_rig.has_triggerbox:
+            self.pm.log_line.emit(f"Rig {self.active_rig.label} has no triggerbox_host preset")
+            return
         self.pm.run_once(
             "disable_trigger_output",
             'ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}"'
@@ -651,7 +967,7 @@ class CameraTable(QtWidgets.QTableWidget):
 
 
 class CameraPanel(QtWidgets.QGroupBox):
-    def __init__(self, ros: CameraControlRos, metadata_panel: MetadataPanel):
+    def __init__(self, ros: CameraControlRos, metadata_panel: MetadataPanel, bottom_left_widget: Optional[QtWidgets.QWidget] = None):
         super().__init__("Cameras")
         self.ros = ros
         self.metadata_panel = metadata_panel
@@ -708,7 +1024,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.apply_start_btn = QtWidgets.QPushButton("Apply + start recording")
         self.start_btn = QtWidgets.QPushButton("Start recording")
         self.stop_btn = QtWidgets.QPushButton("Stop recording")
-        self.preview_btn = QtWidgets.QPushButton("Open preview…")
+        self.preview_btn = QtWidgets.QPushButton("Open preview?")
 
         settings = QtWidgets.QFormLayout()
         settings.addRow("Mode", self.mode)
@@ -748,7 +1064,9 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         left = QtWidgets.QVBoxLayout()
         left.addLayout(top_buttons)
-        left.addWidget(self.table)
+        left.addWidget(self.table, stretch=1)
+        if bottom_left_widget is not None:
+            left.addWidget(bottom_left_widget, stretch=1)
 
         right = QtWidgets.QVBoxLayout()
         right.addWidget(settings_box)
@@ -918,13 +1236,13 @@ class CameraPanel(QtWidgets.QGroupBox):
             widget.setStyleSheet(self._style_for_state(state))
 
         if self.settings_state == "mixed":
-            text = "Settings: mixed/partial ⚠"
+            text = "Settings: mixed/partial ?"
         elif any_dirty:
             text = "Settings: local edits not applied"
         elif any_unknown:
             text = "Settings: unknown, read from camera"
         else:
-            text = "Settings: synced ✅"
+            text = "Settings: synced ?"
         self.settings_sync_label.setText(text)
 
     def _baseline_from_current(self):
@@ -1237,6 +1555,10 @@ class RosProcessManager(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.processes: Dict[str, QtCore.QProcess] = {}
+        # Names of processes we intentionally asked to stop. Qt reports SIGTERM
+        # exits as CrashExit, which is alarming but expected for helpers like
+        # triggerbox_host that do not have a lifecycle shutdown transition.
+        self.expected_stops: set[str] = set()
 
     def launch(self, name: str, command: str):
         if name in self.processes:
@@ -1252,17 +1574,19 @@ class RosProcessManager(QtCore.QObject):
             lambda name=name, proc=proc: self._read_output(name, proc)
         )
         proc.finished.connect(
-            lambda code, status, name=name: self.log_line.emit(
-                f"{name} exited with code {code}, status={status}"
-            )
+            lambda code, status, name=name: self._process_finished(name, code, status)
         )
 
         self.processes[name] = proc
 
+        # Use exec so QProcess owns the long-running ROS process, not only
+        # a short-lived bash wrapper. Without this, terminate()/kill() can
+        # stop bash while leaving ros2/triggerbox_host alive as an orphaned
+        # ROS node.
         full_cmd = (
             "source /opt/ros/jazzy/setup.bash && "
             "source ~/ros2_ws/install/setup.bash && "
-            f"{command}"
+            f"exec {command}"
         )
 
         self.log_line.emit(f"Launching {name}: {command}")
@@ -1290,11 +1614,28 @@ class RosProcessManager(QtCore.QObject):
         self.log_line.emit(f"Running {name}: {command}")
         proc.start("bash", ["-lc", full_cmd])
 
+    def stop(self, name: str):
+        proc = self.processes.get(name)
+        if proc is None:
+            return
+        if proc.state() != QtCore.QProcess.NotRunning:
+            self.log_line.emit(f"Stopping {name}")
+            self.expected_stops.add(name)
+            proc.terminate()
+            QtCore.QTimer.singleShot(2000, lambda name=name: self.kill_one(name))
+
+    def kill_one(self, name: str):
+        proc = self.processes.get(name)
+        if proc is None:
+            return
+        if proc.state() != QtCore.QProcess.NotRunning:
+            self.log_line.emit(f"Killing {name}")
+            self.expected_stops.add(name)
+            proc.kill()
+
     def stop_all(self):
-        for name, proc in self.processes.items():
-            if proc.state() != QtCore.QProcess.NotRunning:
-                self.log_line.emit(f"Stopping {name}")
-                proc.terminate()
+        for name in list(self.processes.keys()):
+            self.stop(name)
 
         QtCore.QTimer.singleShot(2000, self.kill_remaining)
 
@@ -1302,7 +1643,24 @@ class RosProcessManager(QtCore.QObject):
         for name, proc in self.processes.items():
             if proc.state() != QtCore.QProcess.NotRunning:
                 self.log_line.emit(f"Killing {name}")
+                self.expected_stops.add(name)
                 proc.kill()
+
+    def _process_finished(self, name: str, code: int, status: QtCore.QProcess.ExitStatus):
+        expected = name in self.expected_stops
+        if expected:
+            self.expected_stops.discard(name)
+
+        status_name = getattr(status, "name", str(status))
+
+        # SIGTERM usually appears as code 15 + CrashExit. That is fine when the
+        # GUI requested it, especially for triggerbox_host after disabling output.
+        if expected and code in (0, 15):
+            self.log_line.emit(f"{name} stopped cleanly after requested stop")
+        elif code != 0:
+            self.log_line.emit(f"ERROR: {name} exited with code {code}, status={status_name}")
+        else:
+            self.log_line.emit(f"{name} exited with code {code}, status={status_name}")
 
     def _read_output(self, name: str, proc: QtCore.QProcess):
         data = bytes(proc.readAllStandardOutput()).decode(errors="replace")
@@ -1323,17 +1681,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.metadata_panel = MetadataPanel()
         self.metadata_summary = MetadataSummary(self.metadata_panel)
-        self.camera_panel = CameraPanel(ros, self.metadata_panel)
-        self.ros.set_event_callback(self.append_log)
-
-        self.process_manager = RosProcessManager(self)
-        self.process_manager.log_line.connect(self.append_log)
-        self.system_panel = SystemPanel(self.process_manager, self.camera_panel)
 
         self.log_box = QtWidgets.QPlainTextEdit()
         self.log_box.setReadOnly(True)
         self.log_box.setMaximumBlockCount(800)
-        self.log_box.setMaximumHeight(170)
+        self.log_box.setMinimumHeight(150)
         self.log_box.setPlaceholderText("Camera events, recording events, storage updates, and service results appear here.")
 
         self.clear_log_btn = QtWidgets.QPushButton("Clear")
@@ -1341,15 +1693,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.autoscroll_chk = QtWidgets.QCheckBox("Auto-scroll")
         self.autoscroll_chk.setChecked(True)
         self.clear_log_btn.clicked.connect(self.log_box.clear)
-
-        self.tabs = QtWidgets.QTabWidget()
-
-        tab_camera = QtWidgets.QWidget()
-        cam_layout = QtWidgets.QVBoxLayout()
-        cam_layout.setContentsMargins(6, 6, 6, 6)
-        cam_layout.addWidget(self.system_panel)
-        cam_layout.addWidget(self.metadata_summary)
-        cam_layout.addWidget(self.camera_panel, stretch=1)
 
         log_header = QtWidgets.QHBoxLayout()
         log_header.addWidget(QtWidgets.QLabel("Event log"))
@@ -1363,7 +1706,22 @@ class MainWindow(QtWidgets.QMainWindow):
         log_layout.addWidget(self.log_box)
         log_group = QtWidgets.QGroupBox()
         log_group.setLayout(log_layout)
-        cam_layout.addWidget(log_group)
+
+        self.camera_panel = CameraPanel(ros, self.metadata_panel, bottom_left_widget=log_group)
+        self.ros.set_event_callback(self.append_log)
+
+        self.process_manager = RosProcessManager(self)
+        self.process_manager.log_line.connect(self.append_log)
+        self.system_panel = SystemPanel(self.process_manager, self.camera_panel)
+
+        self.tabs = QtWidgets.QTabWidget()
+
+        tab_camera = QtWidgets.QWidget()
+        cam_layout = QtWidgets.QVBoxLayout()
+        cam_layout.setContentsMargins(6, 6, 6, 6)
+        cam_layout.addWidget(self.system_panel)
+        cam_layout.addWidget(self.metadata_summary)
+        cam_layout.addWidget(self.camera_panel, stretch=1)
 
         tab_camera.setLayout(cam_layout)
         self.tabs.addTab(tab_camera, "Cameras")
