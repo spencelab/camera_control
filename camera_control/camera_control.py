@@ -23,6 +23,8 @@ Install/run sketch:
 
 from __future__ import annotations
 
+import ast
+
 import os
 import re
 import sys
@@ -119,26 +121,92 @@ def _flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
             out[full] = value
     return out
 
+def _key_matches_node(key: Any, node_name: str) -> bool:
+    """Return True if a YAML top-level key applies to this node.
 
-def parse_settings_yaml(text: str) -> Dict[str, Any]:
+    Supports normal ROS param keys:
+
+        cam1:
+          ros__parameters:
+
+    and shared/list-style keys:
+
+        ['cambuffer_recorder_ng', 'cam1']:
+          ros__parameters:
+    """
+    node_name = str(node_name or "").strip().strip("/")
+
+    if not node_name:
+        return False
+
+    if isinstance(key, (list, tuple)):
+        return node_name in [str(x).strip().strip("/") for x in key]
+
+    text = str(key).strip().strip('"').strip("'").strip("/")
+
+    if text == node_name:
+        return True
+
+    # Supports string keys like "['cambuffer_recorder_ng','cam1']"
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = ast.literal_eval(text)
+            if isinstance(parsed, (list, tuple)):
+                return node_name in [str(x).strip().strip("/") for x in parsed]
+        except Exception:
+            pass
+
+    return False
+
+def parse_settings_yaml(text: str, node_name: str = "") -> Dict[str, Any]:
     """Parse CBRNG settings YAML into flat dotted keys.
 
     Prefer PyYAML if available. Fall back to a tiny parser that handles the
     simple flat YAML we send plus basic one/two-level ROS param dumps.
+
+    Also supports shared node-name keys such as:
+
+        ['cambuffer_recorder_ng', 'cam1']:
+          ros__parameters:
+            camera.width: 2048
     """
     text = text or ""
     if not text.strip():
         return {}
+
     try:
         import yaml  # type: ignore
         data = yaml.safe_load(text)
+
         if isinstance(data, dict):
+            # New behavior:
+            # If node_name is supplied, first look for a matching top-level key.
+            # This supports both:
+            #
+            # cam1:
+            #   ros__parameters:
+            #
+            # and:
+            #
+            # ['cambuffer_recorder_ng','cam1']:
+            #   ros__parameters:
+            if node_name:
+                for key, value in data.items():
+                    if _key_matches_node(key, node_name):
+                        if isinstance(value, dict) and "ros__parameters" in value:
+                            return _flatten_dict(value["ros__parameters"])
+                        if isinstance(value, dict):
+                            return _flatten_dict(value)
+
+            # Existing behavior:
             # Some dumps may be /node: ros__parameters: ...; peel that if present.
             if len(data) == 1:
                 only = next(iter(data.values()))
                 if isinstance(only, dict) and "ros__parameters" in only:
                     data = only["ros__parameters"]
+
             return _flatten_dict(data)
+
     except Exception:
         pass
 
@@ -815,7 +883,14 @@ class SystemPanel(QtWidgets.QGroupBox):
             str(QtCore.QSettings("SpenceLab", "camera_control").value("launch/default_rig", RIG_PRESETS[0].key))
         )
 
+        ### New add (Select system):
+        # Allow users to choose the active rig/system without launching anything.
+        # This is useful when nodes are already running and the GUI only needs
+        # to attach to an existing system configuration.
+        self.select_btn = QtWidgets.QPushButton("Select system")
+
         self.launch_btn = QtWidgets.QPushButton("Launch system")
+
         self.configure_btn = QtWidgets.QPushButton("Configure cameras")
         self.enable_trigger_btn = QtWidgets.QPushButton("Enable trigger output")
         self.disable_trigger_btn = QtWidgets.QPushButton("Disable trigger output")
@@ -824,6 +899,14 @@ class SystemPanel(QtWidgets.QGroupBox):
         self.active_rig_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
         layout = QtWidgets.QHBoxLayout()
+
+        ### New add (Select system):
+        # Place Select System immediately before Launch System.
+        # Workflow becomes:
+        #   Select System -> choose rig only
+        #   Launch System -> launch currently selected rig
+        layout.addWidget(self.select_btn)
+
         layout.addWidget(self.launch_btn)
         layout.addWidget(self.configure_btn)
         layout.addWidget(self.enable_trigger_btn)
@@ -833,18 +916,52 @@ class SystemPanel(QtWidgets.QGroupBox):
         layout.addStretch(1)
         self.setLayout(layout)
 
+        ### New add (Select system):
+        # Separate rig selection from launching.
+        # Selecting a rig updates the active rig and camera expectations
+        # without starting any ROS processes.
+        self.select_btn.clicked.connect(self.select_system)
+
         self.launch_btn.clicked.connect(self.launch_system)
         self.configure_btn.clicked.connect(self.configure_cameras)
         self.enable_trigger_btn.clicked.connect(self.enable_trigger_output)
         self.disable_trigger_btn.clicked.connect(self.disable_trigger_output)
         self.stop_processes_btn.clicked.connect(self.shutdown_system)
 
-    def launch_system(self):
+    ### New add (Select system):
+    # Allow rig selection without launching processes.
+    # Previously Launch System always opened the rig selection dialog.
+    # This method lets users switch rigs while leaving currently-running
+    # nodes untouched.
+
+    # Typical use cases:
+    #   - GUI reconnecting to an already-running system
+    #   - Reviewing a different rig configuration
+    #   - Preparing a rig before launching later
+    def select_system(self) -> bool:
         dlg = RigSelectDialog(self)
+        dlg.setWindowTitle("Select system")
+
+        buttons = dlg.findChild(QtWidgets.QDialogButtonBox)
+
+        if buttons is not None:
+            buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Select")
+
         if dlg.exec() != QtWidgets.QDialog.Accepted:
-            return
+            return False
+
         self.active_rig = dlg.selected_rig()
         self.active_rig_label.setText(f"Rig: {self.active_rig.label}")
+        self.pm.log_line.emit(f"Selected rig: {self.active_rig.label}")
+        QtCore.QTimer.singleShot(100, self.camera_panel.discover)
+        return True
+    
+    ### Revised (Launch system):
+    # Launch the currently selected rig.
+    # Rig selection is now handled by select_system().
+    # Launching should no longer prompt for rig selection each time.
+    def launch_system(self):
+        self.pm.log_line.emit(f"Launching selected rig: {self.active_rig.label}")
 
         for spec in self.active_rig.processes:
             self.pm.launch(spec.name, spec.command)
@@ -1275,7 +1392,11 @@ class CameraPanel(QtWidgets.QGroupBox):
             self._set_mixed_or_unknown(f"read settings failed for {full}: {e}")
             return
         text = getattr(resp, "effective_settings_yaml", "") or getattr(resp, "requested_settings_yaml", "") or ""
-        values = parse_settings_yaml(text)
+
+        # Pass the actual node name so shared/list-style YAML keys
+        # can be resolved correctly.
+        values = parse_settings_yaml(text, node_name=full.strip("/"))
+
         if not values:
             self._set_mixed_or_unknown(f"read settings from {full}: no effective settings YAML returned")
             return
