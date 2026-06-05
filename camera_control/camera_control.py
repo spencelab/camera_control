@@ -1462,6 +1462,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, ros: CameraControlRos):
         super().__init__()
         self.ros = ros
+        self._close_cleanup_in_progress = False
+        self._close_cleanup_complete = False
+        self._close_cleanup_timeout = QtCore.QTimer(self)
+        self._close_cleanup_timeout.setSingleShot(True)
+        self._close_cleanup_timeout.timeout.connect(self._finish_close_after_treadmill_cleanup)
         self.setWindowTitle("camera_control: cameras + metadata")
         # Let Qt choose a natural initial size; avoid unnecessary scrollbars.
 
@@ -1550,6 +1555,85 @@ class MainWindow(QtWidgets.QMainWindow):
             event.accept()
             return
         super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        """Stop and release an enabled treadmill before allowing GUI shutdown.
+
+        The treadmill host may be an external process, so closing this GUI must not
+        rely on destruction of the host node to leave the treadmill in a safe state.
+        """
+        if self._close_cleanup_complete:
+            event.accept()
+            return
+
+        if self._close_cleanup_in_progress:
+            event.ignore()
+            return
+
+        panel = getattr(self, "treadmill_panel", None)
+        if panel is None or not panel.enabled_for_keys():
+            event.accept()
+            return
+
+        event.ignore()
+        self._close_cleanup_in_progress = True
+        self.append_log("GUI exit: stopping treadmill and releasing PC control...")
+
+        # Never hold the window hostage if the external host disappeared.
+        self._close_cleanup_timeout.start(2000)
+        self._request_treadmill_stop_for_close()
+
+    def _request_treadmill_stop_for_close(self):
+        try:
+            fut = self.ros.treadmill_trigger_async("stop")
+            if fut is None:
+                raise RuntimeError("treadmill_control package is unavailable")
+            fut.add_done_callback(self._treadmill_stop_for_close_done)
+        except Exception as exc:
+            self.append_log(f"GUI exit: treadmill stop request failed: {exc}")
+            self._request_treadmill_release_for_close()
+
+    def _treadmill_stop_for_close_done(self, fut):
+        try:
+            resp = fut.result()
+            ok = bool(getattr(resp, "success", False))
+            message = str(getattr(resp, "message", ""))
+            self.append_log(f"GUI exit: treadmill stop: {'OK' if ok else 'FAIL'} - {message}")
+        except Exception as exc:
+            self.append_log(f"GUI exit: treadmill stop failed: {exc}")
+        finally:
+            # Release control even if STOP failed. The two actions are deliberately
+            # independent so one service error cannot suppress the other.
+            self._request_treadmill_release_for_close()
+
+    def _request_treadmill_release_for_close(self):
+        try:
+            fut = self.ros.treadmill_trigger_async("release_control")
+            if fut is None:
+                raise RuntimeError("treadmill_control package is unavailable")
+            fut.add_done_callback(self._treadmill_release_for_close_done)
+        except Exception as exc:
+            self.append_log(f"GUI exit: treadmill release request failed: {exc}")
+            self._finish_close_after_treadmill_cleanup()
+
+    def _treadmill_release_for_close_done(self, fut):
+        try:
+            resp = fut.result()
+            ok = bool(getattr(resp, "success", False))
+            message = str(getattr(resp, "message", ""))
+            self.append_log(f"GUI exit: treadmill release: {'OK' if ok else 'FAIL'} - {message}")
+        except Exception as exc:
+            self.append_log(f"GUI exit: treadmill release failed: {exc}")
+        finally:
+            self._finish_close_after_treadmill_cleanup()
+
+    def _finish_close_after_treadmill_cleanup(self):
+        if self._close_cleanup_complete:
+            return
+        self._close_cleanup_timeout.stop()
+        self._close_cleanup_complete = True
+        self._close_cleanup_in_progress = False
+        QtCore.QTimer.singleShot(0, self.close)
 
     def goto_metadata_tab(self):
         self.tabs.setCurrentIndex(1)
