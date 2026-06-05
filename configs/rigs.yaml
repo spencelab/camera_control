@@ -58,7 +58,7 @@ rigs:
     camera_nodes: [cam1]
     processes:
       - name: triggerbox_host
-        command: "ros2 run triggerbox_ros2 triggerbox_host /dev/trig2"
+        command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig2"
       - name: cam1
         command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
     shutdown_commands:
@@ -78,7 +78,7 @@ rigs:
     camera_nodes: [cam1, cam2]
     processes:
       - name: triggerbox_host
-        command: "ros2 run triggerbox_ros2 triggerbox_host /dev/trig2"
+        command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig2"
       - name: cam1
         command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
       - name: cam2@10.0.0.2
