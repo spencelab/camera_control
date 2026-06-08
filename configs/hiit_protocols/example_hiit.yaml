@@ -1,0 +1,132 @@
+# ============================================================
+# RatLab Treadmill — Phased Training Regimen
+# ------------------------------------------------------------
+# Author       : Andrew England <andrewengland19@gmail.com>
+# Last updated : 2026-06-02
+# ============================================================
+#
+# Loaded via the Treadmill window's "⬆ Import Regimen" button and executed
+# step-by-step by "▶ Run Protocol". The belt walks through each step in order:
+# it ramps from the current speed to the step's target at that step's OWN ramp
+# rate, then holds the target for `duration` seconds before moving on.
+#
+# Top-level keys
+#   protocol_name : human-readable name (stored in the session + report)
+#   date          : protocol date (shown in the GUI: "Regimen: <name> | <date>")
+#   description   : free-text notes
+#   target/step/every : seed values for the manual "Ramp Protocol" spinboxes
+#                       (the phased runner ignores these — it uses `steps`)
+#
+# defaults
+#   ramp_rate_cm_s2 : fallback ramp rate for steps that omit `ramp_rate`
+#
+# steps  — executed top to bottom
+#   type: run
+#     speed     (int, cm/s)        target speed for this phase
+#     duration  (int/float, s)     hold time AT the target (after ramping)
+#     ramp_rate (float, cm/s per second) — how fast to approach `speed` from
+#               the previous speed. This is the per-step "turn/spike" knob:
+#                 • small  (e.g. 1)   → slow, gradual ramp
+#                 • large  (e.g. 10)  → barely ramps, near-instant punch
+#                 • 0                 → instant jump, no ramp
+#               Omit it to use defaults.ramp_rate_cm_s2.
+#     label     (str, optional)    shown in the live phase indicator
+#
+#   type: loop
+#     count  (int)                 repeat the nested block N times
+#     steps  (list)                same syntax, nesting allowed
+# ============================================================
+
+protocol_name: HIIT_ProgressiveSprints
+date: 2026-06-02
+description: >
+  Warm-up at 16 cm/s, build to a 25 cm/s baseline, then sprint/recovery
+  intervals (36 <-> 25 cm/s). Each sprint uses its own ramp rate so the spike
+  in can be punchy or gradual per cycle, then a final loop of steady cycles
+  and a cool-down.
+
+# Seeds for the manual Ramp Protocol spinboxes (phased runner uses `steps`).
+target: 36
+step: 5
+every: 120
+
+defaults:
+  ramp_rate_cm_s2: 3        # fallback for any step missing `ramp_rate`
+
+steps:
+  # -- Phase 1 — warm-up --------------------------------------------
+  - type: run
+    speed: 16
+    duration: 90
+    ramp_rate: 2            # gentle ease-in from 0 -> 16
+    label: warm-up
+
+  # -- Phase 2 — build to baseline ----------------------------------
+  - type: run
+    speed: 25
+    duration: 30
+    ramp_rate: 1            # slow build 16 -> 25
+    label: build to baseline
+
+  # -- Phase 3 — sprint/recovery intervals --------------------------
+  # Each sprint's ramp_rate is tuned independently to demonstrate
+  # punchy vs. gradual spikes; recoveries ease back down to 25 cm/s.
+  - type: run
+    speed: 36
+    duration: 15
+    ramp_rate: 10           # barely ramps — near-instant punch up
+    label: sprint 1
+  - type: run
+    speed: 25
+    duration: 90
+    ramp_rate: 2            # gentle ramp down
+    label: recovery 1
+
+  - type: run
+    speed: 36
+    duration: 15
+    ramp_rate: 4            # moderate spike
+    label: sprint 2
+  - type: run
+    speed: 25
+    duration: 90
+    ramp_rate: 1            # slow ramp down
+    label: recovery 2
+
+  - type: run
+    speed: 36
+    duration: 15
+    ramp_rate: 0            # instant jump, no ramp at all
+    label: sprint 3
+  - type: run
+    speed: 25
+    duration: 90
+    ramp_rate: 3
+    label: recovery 3
+
+  # -- Phase 4 — steady interval block (identical cycles via loop) ---
+  - type: loop
+    count: 3
+    steps:
+      - type: run
+        speed: 36
+        duration: 15
+        ramp_rate: 6
+        label: sprint (block)
+      - type: run
+        speed: 25
+        duration: 90
+        ramp_rate: 2
+        label: recovery (block)
+
+  # -- Phase 5 — cool-down ------------------------------------------
+  - type: run
+    speed: 10
+    duration: 120
+    ramp_rate: 1.5          # slow wind-down 25 -> 10
+    label: cool-down
+  - type: run
+    speed: 0
+    duration: 0
+    ramp_rate: 2            # ease to a stop
+    label: stop
