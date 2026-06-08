@@ -195,6 +195,11 @@ def _demo() -> int:
     controller = HiitController(ros, tmill, panel, log_fn=lambda m: print(f"[log] {m}"))
     panel.set_controller(controller)
 
+    # Auto-load the shipped example so the panel opens populated and Run works.
+    example = controller.default_dir() / "example_hiit.yaml"
+    if example.is_file():
+        controller.request_import(str(example))
+
     win = QtWidgets.QWidget()
     lay = QtWidgets.QVBoxLayout(win)
     lay.addWidget(panel)
