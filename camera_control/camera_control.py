@@ -56,6 +56,17 @@ except Exception:
     TreadmillSetSpeed = None
     TREADMILL_CONTROL_AVAILABLE = False
 
+# Optional YAML-driven HIIT trainer (additive; lives in the hiit/ subpackage).
+# Guarded so any import problem leaves the existing GUI fully functional.
+try:
+    from hiit.panel import HiitPanel
+    from hiit.controller import HiitController
+    HIIT_AVAILABLE = True
+except Exception:
+    HiitPanel = None
+    HiitController = None
+    HIIT_AVAILABLE = False
+
 
 DISCOVERY_INTERVAL_MS = 1500
 STATUS_INTERVAL_MS = 1000
@@ -1933,6 +1944,9 @@ class TreadmillPanel(QtWidgets.QGroupBox):
         self.ros = ros
         self.latest_status = None
         self.commanded_speed = 0
+        # Set True by the HIIT trainer while a protocol runs, to lock out manual
+        # control. Default False -> manual control works with zero HIIT interaction.
+        self._hiit_lock = False
 
         self.use_treadmill = QtWidgets.QCheckBox("Use treadmill")
         self.port_edit = QtWidgets.QLineEdit("/dev/treadmill1")
@@ -1980,10 +1994,12 @@ class TreadmillPanel(QtWidgets.QGroupBox):
         speed_row.addStretch(1)
 
         preset_grid = QtWidgets.QGridLayout()
+        self._preset_btns = []
         for i, speed in enumerate(list(range(0, 100, 10)) + [100]):
             btn = QtWidgets.QPushButton(str(speed))
             btn.clicked.connect(lambda checked=False, s=speed: self.set_speed(s))
             preset_grid.addWidget(btn, i // 6, i % 6)
+            self._preset_btns.append(btn)
 
         help_label = QtWidgets.QLabel("Keys when Use treadmill is checked: c control, r run/stop, 0-9 speeds 0-90, [ ] +/-2 cm/s")
         help_label.setWordWrap(True)
@@ -2061,7 +2077,28 @@ class TreadmillPanel(QtWidgets.QGroupBox):
             base = int(self.latest_status.commanded_speed_cm_s)
         self.set_speed(base + int(delta))
 
+    def set_manual_enabled(self, enabled: bool) -> None:
+        """Enable/disable the manual command controls.
+
+        Used by the HIIT trainer to take exclusive control while a protocol
+        runs (mutual exclusion). Port field and the 'Use treadmill' checkbox
+        are left alone; treadmill keyboard shortcuts are gated separately via
+        the ``_hiit_lock`` guard in ``handle_key``.
+        """
+        widgets = [
+            self.detect_btn, self.connect_btn, self.disconnect_btn,
+            self.take_control_btn, self.release_control_btn,
+            self.run_btn, self.stop_btn,
+            self.speed_spin, self.set_speed_btn, self.down_btn, self.up_btn,
+        ]
+        for w in widgets:
+            w.setEnabled(enabled)
+        for b in getattr(self, "_preset_btns", []):
+            b.setEnabled(enabled)
+
     def handle_key(self, key: int, text: str) -> bool:
+        if getattr(self, "_hiit_lock", False):
+            return False
         if not self.enabled_for_keys():
             return False
         if text == "c":
@@ -2198,6 +2235,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.process_manager.log_line.connect(self.append_log)
         self.system_panel = SystemPanel(self.process_manager, self.camera_panel)
 
+        # Optional HIIT trainer (additive). Mounted under the manual treadmill
+        # controls on the Treadmill tab; absent entirely if the package or its
+        # deps are unavailable, leaving the existing GUI unchanged.
+        self.hiit_panel = None
+        self.hiit_controller = None
+        if HIIT_AVAILABLE:
+            try:
+                self.hiit_panel = HiitPanel()
+                self.hiit_controller = HiitController(
+                    ros, self.treadmill_panel, self.hiit_panel, log_fn=self.append_log
+                )
+                self.hiit_panel.set_controller(self.hiit_controller)
+            except Exception as exc:  # never let HIIT break the cockpit
+                self.hiit_panel = None
+                self.hiit_controller = None
+                print(f"WARNING: HIIT trainer disabled: {exc}", file=sys.stderr)
+
         self.tabs = QtWidgets.QTabWidget()
 
         tab_camera = QtWidgets.QWidget()
@@ -2223,6 +2277,8 @@ class MainWindow(QtWidgets.QMainWindow):
         treadmill_layout = QtWidgets.QVBoxLayout()
         treadmill_layout.setContentsMargins(12, 12, 12, 12)
         treadmill_layout.addWidget(self.treadmill_panel)
+        if self.hiit_panel is not None:
+            treadmill_layout.addWidget(self.hiit_panel)
         treadmill_layout.addStretch(1)
         tab_treadmill.setLayout(treadmill_layout)
         self.tabs.addTab(tab_treadmill, "Treadmill")
