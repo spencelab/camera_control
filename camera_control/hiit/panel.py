@@ -23,6 +23,18 @@ def _fmt_mmss(seconds: float) -> str:
     return f"{seconds // 60:d}:{seconds % 60:02d}"
 
 
+# Status-chip styles for the regimen label (no external deps; plain stylesheet).
+_REGIMEN_UNLOADED_STYLE = (
+    "QLabel { color: #b00020; background: #fce8e6; border: 1px solid #d93025;"
+    " border-radius: 4px; padding: 4px 8px; }"
+)
+_REGIMEN_LOADED_STYLE = (
+    "QLabel { color: #137333; background: #e6f4ea; border: 1px solid #34a853;"
+    " border-radius: 4px; padding: 4px 8px; font-weight: bold; }"
+)
+_REGIMEN_NONE_TEXT = "🛑 No regimen loaded"
+
+
 class HiitPanel(QtWidgets.QGroupBox):
     """HIIT / phased trainer controls, mounted under the manual TreadmillPanel."""
 
@@ -33,8 +45,9 @@ class HiitPanel(QtWidgets.QGroupBox):
 
         # --- widgets ---
         self.import_btn = QtWidgets.QPushButton("⬆ Import Regimen…")
-        self.regimen_label = QtWidgets.QLabel("Regimen: (none loaded)")
+        self.regimen_label = QtWidgets.QLabel(_REGIMEN_NONE_TEXT)
         self.regimen_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.regimen_label.setStyleSheet(_REGIMEN_UNLOADED_STYLE)
 
         self.run_btn = QtWidgets.QPushButton("▶ Run Protocol")
         self.pause_btn = QtWidgets.QPushButton("⏸ Pause")
@@ -108,8 +121,9 @@ class HiitPanel(QtWidgets.QGroupBox):
         self._has_protocol = True
         suffix = f" | {date}" if date else ""
         self.regimen_label.setText(
-            f"Regimen: {name}{suffix}  —  {stage_count} stages, ~{_fmt_mmss(est_total_s)}"
+            f"✅ {name}{suffix}  —  {stage_count} stages, ~{_fmt_mmss(est_total_s)}"
         )
+        self.regimen_label.setStyleSheet(_REGIMEN_LOADED_STYLE)
         self.stage_bar.setValue(0)
         self.overall_bar.setValue(0)
         self.phase_label.setText("Phase: ready")
@@ -194,11 +208,9 @@ def _demo() -> int:
     tmill = _MockTreadmillPanel()
     controller = HiitController(ros, tmill, panel, log_fn=lambda m: print(f"[log] {m}"))
     panel.set_controller(controller)
-
-    # Auto-load the shipped example so the panel opens populated and Run works.
-    example = controller.default_dir() / "example_hiit.yaml"
-    if example.is_file():
-        controller.request_import(str(example))
+    # No regimen is loaded by default: the panel opens in the red "no regimen"
+    # state. Use "⬆ Import Regimen…" to load one (file dialog opens in the
+    # configs/hiit_protocols dir).
 
     win = QtWidgets.QWidget()
     lay = QtWidgets.QVBoxLayout(win)
