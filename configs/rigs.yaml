@@ -8,9 +8,31 @@
 #
 # Commands below intentionally preserve the original launch style:
 # the GUI wraps each command with:
-#   source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && ...
+#   source /opt/ros/DISTRO/setup.bash && source ~/ros2_ws/install/setup.bash && ...
 
 rigs:
+  - key: spence_mac_vm_2fakecams_fake_treadmill
+    label: spence_mac_vm_2fakecams_fake_treadmill
+    description: "Multipass Ubuntu VM: two local fake cameras at 320x240, 1 FPS, plus fake treadmill control. No triggerbox."
+    has_triggerbox: false
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1, cam2]
+    processes:
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 -p backend:=fake -p width:=320 -p height:=240   -p fps:=1.0 -p output_path:=/home/spencelab/camera_sessions/fakecam1_vm_test.mp4"
+      - name: cam2
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 -p backend:=fake -p width:=320 -p height:=240   -p fps:=1.0 -p output_path:=/home/spencelab/camera_sessions/fakecam2_vm_test.mp4"
+      - name: treadmill_host
+        command: "ros2 run treadmill_control treadmill_host --fake --ros-args -p enabled:=true -p auto_connect:=true"
+    shutdown_commands:
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+      - name: shutdown_cam2
+        command: "timeout 10s ros2 lifecycle set /cam2 shutdown || true"
+      - name: shutdown_fake_treadmill
+        command: "pkill -INT -f '[t]readmill_control.*treadmill_host' || true"
+
   - key: gavin_vm_barebones_2cams_tbox
     label: gavin_vm_barebones_2cams_tbox
     description: "Original barebones launcher: local triggerbox_host plus local cam1/cam2."
