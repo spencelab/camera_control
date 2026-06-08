@@ -98,7 +98,31 @@ def flat_yaml(settings: Dict[str, Any]) -> str:
         lines.append(f"{key}: {rendered}")
     return "\n".join(lines) + "\n"
 
+# Detect which ros distro so can launch in either:
+def ros_shell_prefix() -> str:
+    """Return shell setup commands for the active ROS distro and workspace."""
+    ros_distro = os.environ.get("ROS_DISTRO", "").strip()
 
+    if not ros_distro:
+        for candidate in ("jazzy", "humble"):
+            if Path(f"/opt/ros/{candidate}/setup.bash").exists():
+                ros_distro = candidate
+                break
+
+    if not ros_distro:
+        raise RuntimeError(
+            "Could not determine ROS distro. Source /opt/ros/<distro>/setup.bash "
+            "before launching camera_control."
+        )
+
+    ros_setup = Path(f"/opt/ros/{ros_distro}/setup.bash")
+    if not ros_setup.exists():
+        raise RuntimeError(f"ROS setup file not found: {ros_setup}")
+
+    return (
+        f"source {shlex.quote(str(ros_setup))} && "
+        "source ~/ros2_ws/install/setup.bash && "
+    )
 
 # --------------------------
 # Lightweight YAML helpers for CBRNG status/apply settings
@@ -738,7 +762,7 @@ def lifecycle_shutdown_command(node: str) -> RigCommandSpec:
 
 def ssh_lifecycle_shutdown_command(host: str, user: str, node: str) -> RigCommandSpec:
     remote_cmd = (
-        "source /opt/ros/jazzy/setup.bash && "
+        "source /opt/ros/humble/setup.bash && "
         "source ~/ros2_ws/install/setup.bash && "
         f"timeout 10s ros2 lifecycle set /{node} shutdown || true"
     )
@@ -1756,6 +1780,7 @@ class RosProcessManager(QtCore.QObject):
         # exits as CrashExit, which is alarming but expected for helpers like
         # triggerbox_host that do not have a lifecycle shutdown transition.
         self.expected_stops: set[str] = set()
+        self.transient_processes: set[QtCore.QProcess] = set()
 
     def launch(self, name: str, command: str):
         if name in self.processes:
@@ -1780,11 +1805,7 @@ class RosProcessManager(QtCore.QObject):
         # a short-lived bash wrapper. Without this, terminate()/kill() can
         # stop bash while leaving ros2/triggerbox_host alive as an orphaned
         # ROS node.
-        full_cmd = (
-            "source /opt/ros/jazzy/setup.bash && "
-            "source ~/ros2_ws/install/setup.bash && "
-            f"exec {command}"
-        )
+        full_cmd = ros_shell_prefix() + f"exec {command}"
 
         self.log_line.emit(f"Launching {name}: {command}")
         proc.start("bash", ["-lc", full_cmd])
@@ -1796,17 +1817,14 @@ class RosProcessManager(QtCore.QObject):
         proc.readyReadStandardOutput.connect(
             lambda name=name, proc=proc: self._read_output(name, proc)
         )
+        self.transient_processes.add(proc)
         proc.finished.connect(
-            lambda code, status, name=name: self.log_line.emit(
-                f"{name} finished with code {code}, status={status}"
+            lambda code, status, name=name, proc=proc: self._run_once_finished(
+                name, proc, code, status
             )
         )
 
-        full_cmd = (
-            "source /opt/ros/jazzy/setup.bash && "
-            "source ~/ros2_ws/install/setup.bash && "
-            f"{command}"
-        )
+        full_cmd = ros_shell_prefix() + command
 
         self.log_line.emit(f"Running {name}: {command}")
         proc.start("bash", ["-lc", full_cmd])
@@ -1834,6 +1852,10 @@ class RosProcessManager(QtCore.QObject):
         for name in list(self.processes.keys()):
             self.stop(name)
 
+        for proc in list(self.transient_processes):
+            if proc.state() != QtCore.QProcess.NotRunning:
+                proc.terminate()
+
         QtCore.QTimer.singleShot(2000, self.kill_remaining)
 
     def kill_remaining(self):
@@ -1842,6 +1864,36 @@ class RosProcessManager(QtCore.QObject):
                 self.log_line.emit(f"Killing {name}")
                 self.expected_stops.add(name)
                 proc.kill()
+
+        for proc in list(self.transient_processes):
+            if proc.state() != QtCore.QProcess.NotRunning:
+                proc.kill()
+
+    def has_running_processes(self) -> bool:
+        launched_running = any(
+            proc.state() != QtCore.QProcess.NotRunning
+            for proc in self.processes.values()
+        )
+        transient_running = any(
+            proc.state() != QtCore.QProcess.NotRunning
+            for proc in self.transient_processes
+        )
+        return launched_running or transient_running
+
+    def _run_once_finished(
+        self,
+        name: str,
+        proc: QtCore.QProcess,
+        code: int,
+        status: QtCore.QProcess.ExitStatus,
+    ):
+        self.transient_processes.discard(proc)
+        try:
+            self.log_line.emit(f"{name} finished with code {code}, status={status}")
+        except RuntimeError:
+            # The application may already be completing final shutdown.
+            pass
+        proc.deleteLater()
 
     def _process_finished(self, name: str, code: int, status: QtCore.QProcess.ExitStatus):
         expected = name in self.expected_stops
@@ -1852,12 +1904,16 @@ class RosProcessManager(QtCore.QObject):
 
         # SIGTERM usually appears as code 15 + CrashExit. That is fine when the
         # GUI requested it, especially for triggerbox_host after disabling output.
-        if expected and code in (0, 15):
-            self.log_line.emit(f"{name} stopped cleanly after requested stop")
-        elif code != 0:
-            self.log_line.emit(f"ERROR: {name} exited with code {code}, status={status_name}")
-        else:
-            self.log_line.emit(f"{name} exited with code {code}, status={status_name}")
+        try:
+            if expected and code in (0, 15):
+                self.log_line.emit(f"{name} stopped cleanly after requested stop")
+            elif code != 0:
+                self.log_line.emit(f"ERROR: {name} exited with code {code}, status={status_name}")
+            else:
+                self.log_line.emit(f"{name} exited with code {code}, status={status_name}")
+        except RuntimeError:
+            # Avoid callbacks into an already-destroyed QObject during final teardown.
+            pass
 
     def _read_output(self, name: str, proc: QtCore.QProcess):
         data = bytes(proc.readAllStandardOutput()).decode(errors="replace")
@@ -2016,7 +2072,7 @@ class TreadmillPanel(QtWidgets.QGroupBox):
             running = bool(getattr(self.latest_status, "running", False)) if self.latest_status is not None else False
             self.trigger("stop" if running else "run")
             return True
-        if text in "0123456789":
+        if len(text) == 1 and text.isdigit():
             self.set_speed(int(text) * 10)
             return True
         if text == "[":
@@ -2096,6 +2152,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._close_cleanup_timeout = QtCore.QTimer(self)
         self._close_cleanup_timeout.setSingleShot(True)
         self._close_cleanup_timeout.timeout.connect(self._finish_close_after_treadmill_cleanup)
+        self._process_close_poll = QtCore.QTimer(self)
+        self._process_close_poll.setInterval(100)
+        self._process_close_poll.timeout.connect(self._poll_process_shutdown_for_close)
+        self._process_close_timeout = QtCore.QTimer(self)
+        self._process_close_timeout.setSingleShot(True)
+        self._process_close_timeout.timeout.connect(self._force_process_shutdown_for_close)
         self.setWindowTitle("camera_control: cameras + metadata")
         # Let Qt choose a natural initial size; avoid unnecessary scrollbars.
 
@@ -2205,12 +2267,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         panel = getattr(self, "treadmill_panel", None)
-        if panel is None or not panel.enabled_for_keys():
-            event.accept()
-            return
-
         event.ignore()
         self._close_cleanup_in_progress = True
+
+        if panel is None or not panel.enabled_for_keys():
+            self._begin_process_shutdown_for_close()
+            return
+
         self.append_log("GUI exit: stopping treadmill and releasing PC control...")
 
         # Never hold the window hostage if the external host disappeared.
@@ -2265,6 +2328,40 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._close_cleanup_complete:
             return
         self._close_cleanup_timeout.stop()
+        self._begin_process_shutdown_for_close()
+
+    def _begin_process_shutdown_for_close(self):
+        self.append_log("GUI exit: shutting down launched system processes...")
+
+        try:
+            self.system_panel.shutdown_system()
+        except Exception as exc:
+            self.append_log(f"GUI exit: system shutdown request failed: {exc}")
+            self.process_manager.stop_all()
+
+        # Rig shutdown commands may intentionally wait before RosProcessManager
+        # terminates launched helpers, so keep Qt alive while they complete.
+        self._process_close_poll.start()
+        self._process_close_timeout.start(15000)
+        self._poll_process_shutdown_for_close()
+
+    def _poll_process_shutdown_for_close(self):
+        if self.process_manager.has_running_processes():
+            return
+        self._complete_gui_close()
+
+    def _force_process_shutdown_for_close(self):
+        self.append_log("GUI exit: forcing remaining launched processes to stop...")
+        self.process_manager.stop_all()
+        self.process_manager.kill_remaining()
+        QtCore.QTimer.singleShot(500, self._complete_gui_close)
+
+    def _complete_gui_close(self):
+        if self._close_cleanup_complete:
+            return
+        self._close_cleanup_timeout.stop()
+        self._process_close_poll.stop()
+        self._process_close_timeout.stop()
         self._close_cleanup_complete = True
         self._close_cleanup_in_progress = False
         QtCore.QTimer.singleShot(0, self.close)
