@@ -35,12 +35,14 @@ class HiitController(QtCore.QObject):
         panel: Any,
         log_fn: Optional[Callable[[str], None]] = None,
         tick_ms: int = 100,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         super().__init__()
         self.ros = ros
         self.treadmill_panel = treadmill_panel
         self.panel = panel
         self._log_fn = log_fn
+        self._clock = clock  # injectable for headless/deterministic tests
         self._runner: Optional[HiitRunner] = None
 
         self._timer = QtCore.QTimer(self)
@@ -77,6 +79,7 @@ class HiitController(QtCore.QObject):
             on_state_change=self._on_state_change,
             on_progress=self._on_progress,
             tick_interval_s=self._timer.interval() / 1000.0,
+            **({"clock": self._clock} if self._clock is not None else {}),
         )
         self.panel.show_protocol(
             proto.protocol_name, proto.date, len(proto.stages), proto.estimated_total_s
