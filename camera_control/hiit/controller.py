@@ -53,6 +53,7 @@ class HiitController(QtCore.QObject):
         self.run_log_dir = run_log_dir
         self._runner: Optional[HiitRunner] = None
         self._runlog: Optional[RunLog] = None
+        self._loaded_protocol = None  # last imported phased regimen
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(tick_ms)
@@ -78,6 +79,46 @@ class HiitController(QtCore.QObject):
             self.panel.show_error(f"Failed to load regimen:\n{exc}")
             self._log(f"HIIT import FAILED ({path}): {exc}")
             return
+        self._loaded_protocol = proto
+        self.panel.show_protocol(
+            proto.protocol_name, proto.date, len(proto.stages), proto.estimated_total_s
+        )
+        # Seed the manual Ramp Protocol spinboxes from the file, if present.
+        fn = getattr(self.panel, "set_ramp_seeds", None)
+        if fn is not None:
+            fn(proto.seed_target, proto.seed_step, proto.seed_every)
+        self._log(
+            f"HIIT regimen loaded: {proto.protocol_name} "
+            f"({len(proto.stages)} stages, ~{proto.estimated_total_s:.0f}s)"
+        )
+
+    def request_start(self) -> None:
+        """Run the imported phased regimen."""
+        if self._loaded_protocol is None:
+            return
+        self._build_and_start(self._loaded_protocol)
+
+    def request_run_ramp(self, target: int, step: int, every: float) -> None:
+        """Build and run a stepwise manual ramp from the current belt speed."""
+        try:
+            proto = protocol_mod.build_ramp_protocol(
+                target, step, every, start=self._current_initial_speed()
+            )
+        except Exception as exc:
+            self.panel.show_error(f"Invalid ramp settings:\n{exc}")
+            self._log(f"HIIT ramp invalid: {exc}")
+            return
+        self._build_and_start(proto)
+
+    def _current_initial_speed(self) -> int:
+        status = getattr(self.treadmill_panel, "latest_status", None)
+        if status is not None:
+            cmd = getattr(status, "commanded_speed_cm_s", -1)
+            if isinstance(cmd, int) and cmd >= 0:
+                return cmd
+        return 0
+
+    def _build_and_start(self, proto) -> None:
         self._runner = HiitRunner(
             proto,
             set_speed=self._sink_set_speed,
@@ -91,32 +132,15 @@ class HiitController(QtCore.QObject):
             tick_interval_s=self._timer.interval() / 1000.0,
             **({"clock": self._clock} if self._clock is not None else {}),
         )
-        self.panel.show_protocol(
-            proto.protocol_name, proto.date, len(proto.stages), proto.estimated_total_s
-        )
-        self._log(
-            f"HIIT regimen loaded: {proto.protocol_name} "
-            f"({len(proto.stages)} stages, ~{proto.estimated_total_s:.0f}s)"
-        )
-
-    def request_start(self) -> None:
-        if self._runner is None:
-            return
-        initial = 0
-        status = getattr(self.treadmill_panel, "latest_status", None)
-        if status is not None:
-            cmd = getattr(status, "commanded_speed_cm_s", -1)
-            if isinstance(cmd, int) and cmd >= 0:
-                initial = cmd
+        initial = self._current_initial_speed()
         # Begin a run-log before starting: start() fires the first stage event.
         if self.enable_run_log:
-            proto = self._runner.protocol
             self._runlog = RunLog(proto.protocol_name, proto.source_path, proto.estimated_total_s)
             self._runlog.start(datetime.now(), self._mono())
         else:
             self._runlog = None
         if self._runner.start(initial_speed=initial):
-            self._log(f"HIIT protocol started (from {initial} cm/s)")
+            self._log(f"HIIT '{proto.protocol_name}' started (from {initial} cm/s)")
 
     def request_toggle_pause(self) -> None:
         if self._runner is None:

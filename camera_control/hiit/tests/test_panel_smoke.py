@@ -154,6 +154,60 @@ def test_pause_resume_and_abort(_app, tmp_path):
     assert tmill._hiit_lock is False  # released on abort
 
 
+def test_manual_ramp_runs_and_logs(_app, tmp_path):
+    clk = _FakeClock()
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    panel = HiitPanel()
+    run_dir = tmp_path / "runs"
+    ctrl = HiitController(
+        ros, tmill, panel, log_fn=lambda m: None, clock=clk, run_log_dir=str(run_dir)
+    )
+    panel.set_controller(ctrl)
+
+    # Run a manual ramp to 20 cm/s, +10 every 1s, from 0.
+    ctrl.request_run_ramp(20, 10, 1)
+    assert tmill._hiit_lock is True          # lockout engaged
+    assert "take_control" in ros.actions and "run" in ros.actions
+    # ramp controls disabled while running
+    assert panel.run_ramp_btn.isEnabled() is False
+
+    for t in [x * 0.5 for x in range(1, 12)]:
+        clk.set(t)
+        ctrl._on_tick()
+
+    assert ctrl._runner.state == HiitState.COMPLETE
+    assert tmill.speeds[-1] == 20            # reached target
+    assert tmill._hiit_lock is False         # released
+    assert panel.run_ramp_btn.isEnabled() is True
+
+    import yaml
+    logs = list(run_dir.glob("hiit_run_*.yaml"))
+    assert len(logs) == 1
+    data = yaml.safe_load(logs[0].read_text(encoding="utf-8"))["hiit_run"]
+    assert data["outcome"] == "complete"
+    assert [s["target_speed_cm_s"] for s in data["stages"]] == [10, 20]
+
+
+def test_import_seeds_ramp_spinboxes(_app, tmp_path):
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    panel = HiitPanel()
+    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None)
+    panel.set_controller(ctrl)
+    p = tmp_path / "seeded.yaml"
+    p.write_text(
+        "protocol_name: Seeded\ntarget: 42\nstep: 7\nevery: 90\n"
+        "defaults:\n  ramp_rate_cm_s2: 2\n"
+        "steps:\n  - {type: run, speed: 10, duration: 1, ramp_rate: 1}\n",
+        encoding="utf-8",
+    )
+    ctrl.request_import(str(p))
+    assert panel.ramp_target.value() == 42
+    assert panel.ramp_step.value() == 7
+    assert panel.ramp_every.value() == 90
+
+
 def test_bad_file_shows_error_not_crash(_app, tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("protocol_name: x\nsteps:\n  - {type: run, speed: 999, duration: 1, ramp_rate: 1}\n", encoding="utf-8")

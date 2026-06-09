@@ -228,3 +228,31 @@ def test_resolved_stage_is_frozen():
     s = ResolvedStage(speed=1, duration=1, ramp_rate=1)
     with pytest.raises(Exception):
         s.speed = 2  # type: ignore
+
+
+# --------------------------
+# Manual ramp builder
+# --------------------------
+def test_build_ramp_from_zero():
+    p = protocol.build_ramp_protocol(target=36, step=5, every=120, start=0)
+    assert [s.speed for s in p.stages] == [5, 10, 15, 20, 25, 30, 35, 36]
+    assert all(s.duration == 120 for s in p.stages)
+    assert all(s.ramp_rate == 0 for s in p.stages)
+    assert p.estimated_total_s == pytest.approx(8 * 120)
+
+
+def test_build_ramp_from_nonzero_start():
+    p = protocol.build_ramp_protocol(target=20, step=5, every=60, start=10)
+    assert [s.speed for s in p.stages] == [15, 20]
+
+
+def test_build_ramp_target_at_or_below_start():
+    p = protocol.build_ramp_protocol(target=20, step=5, every=60, start=30)
+    assert [s.speed for s in p.stages] == [20]
+
+
+def test_build_ramp_rejects_bad_step_and_target():
+    with pytest.raises(ValueError, match="step"):
+        protocol.build_ramp_protocol(target=30, step=0, every=60)
+    with pytest.raises(ValueError, match="out of range"):
+        protocol.build_ramp_protocol(target=101, step=5, every=60)

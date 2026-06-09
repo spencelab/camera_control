@@ -289,3 +289,49 @@ def list_protocols(directory: Optional[os.PathLike | str] = None) -> List[Path]:
     if not d.is_dir():
         return []
     return sorted(p for p in d.iterdir() if p.suffix.lower() in (".yaml", ".yml"))
+
+
+# --------------------------
+# Manual Ramp Protocol (the `target`/`step`/`every` seeds)
+# --------------------------
+def build_ramp_protocol(
+    target: int,
+    step: int,
+    every: float,
+    start: int = 0,
+    ramp_rate: float = 0.0,
+    name: Optional[str] = None,
+) -> HiitProtocol:
+    """Synthesize a stepwise ramp: from ``start``, change by ``step`` cm/s every
+    ``every`` seconds until ``target``, as a normal HiitProtocol (so it runs on
+    the same engine as imported regimens). Each increment is held for ``every``.
+    """
+    target = _as_int(target, "ramp", "target")
+    step = _as_int(step, "ramp", "step")
+    every = _as_number(every, "ramp", "every")
+    start = _as_int(start, "ramp", "start")
+    if not (MIN_SPEED <= target <= MAX_SPEED):
+        raise ValueError(f"ramp 'target' {target} out of range [{MIN_SPEED}, {MAX_SPEED}] cm/s")
+    if step < 1:
+        raise ValueError(f"ramp 'step' must be >= 1, got {step}")
+    if every < 0:
+        raise ValueError(f"ramp 'every' must be >= 0, got {every}")
+    start = max(MIN_SPEED, min(MAX_SPEED, start))
+
+    stages: List[ResolvedStage] = []
+    if target > start:
+        cur = start
+        while cur < target:
+            cur = min(cur + step, target)
+            stages.append(ResolvedStage(cur, every, ramp_rate, f"ramp {cur} cm/s", "manual_ramp"))
+    else:
+        stages.append(ResolvedStage(target, every, ramp_rate, f"set {target} cm/s", "manual_ramp"))
+
+    nm = name or f"Manual Ramp -> {target} (+{step}/{every:g}s)"
+    stages_t = tuple(stages)
+    return HiitProtocol(
+        protocol_name=nm,
+        description=f"Stepwise manual ramp from {start} to {target} cm/s, +{step} every {every:g}s.",
+        stages=stages_t,
+        estimated_total_s=_estimated_total_s(stages_t),
+    )

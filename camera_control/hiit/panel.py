@@ -64,6 +64,22 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.overall_bar.setFormat("overall %p%")
         self.time_label = QtWidgets.QLabel("Stage 0.0 / 0.0 s   |   Total 0:00 / 0:00")
 
+        # Manual Ramp (the target/step/every seeds): stepwise climb, no file needed.
+        self.ramp_target = QtWidgets.QSpinBox()
+        self.ramp_target.setRange(0, 100)
+        self.ramp_target.setValue(30)
+        self.ramp_target.setSuffix(" cm/s")
+        self.ramp_step = QtWidgets.QSpinBox()
+        self.ramp_step.setRange(1, 50)
+        self.ramp_step.setValue(5)
+        self.ramp_step.setPrefix("+")
+        self.ramp_step.setSuffix(" cm/s")
+        self.ramp_every = QtWidgets.QSpinBox()
+        self.ramp_every.setRange(1, 3600)
+        self.ramp_every.setValue(60)
+        self.ramp_every.setSuffix(" s")
+        self.run_ramp_btn = QtWidgets.QPushButton("Run Ramp")
+
         # --- layout ---
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.import_btn)
@@ -76,6 +92,16 @@ class HiitPanel(QtWidgets.QGroupBox):
         controls.addWidget(self.reset_btn)
         controls.addStretch(1)
 
+        ramp_row = QtWidgets.QHBoxLayout()
+        ramp_row.addWidget(QtWidgets.QLabel("Manual ramp →"))
+        ramp_row.addWidget(self.ramp_target)
+        ramp_row.addWidget(QtWidgets.QLabel("by"))
+        ramp_row.addWidget(self.ramp_step)
+        ramp_row.addWidget(QtWidgets.QLabel("every"))
+        ramp_row.addWidget(self.ramp_every)
+        ramp_row.addWidget(self.run_ramp_btn)
+        ramp_row.addStretch(1)
+
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(top)
         layout.addLayout(controls)
@@ -84,6 +110,7 @@ class HiitPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.stage_bar)
         layout.addWidget(self.overall_bar)
         layout.addWidget(self.time_label)
+        layout.addLayout(ramp_row)
         self.setLayout(layout)
 
         # --- signals ---
@@ -92,6 +119,7 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.pause_btn.clicked.connect(lambda: self._request("request_toggle_pause"))
         self.abort_btn.clicked.connect(lambda: self._request("request_abort"))
         self.reset_btn.clicked.connect(lambda: self._request("request_reset"))
+        self.run_ramp_btn.clicked.connect(self._on_run_ramp_clicked)
 
         self._set_buttons_for_state(HiitState.IDLE)
 
@@ -115,6 +143,22 @@ class HiitPanel(QtWidgets.QGroupBox):
         )
         if path and self._controller is not None:
             self._controller.request_import(path)
+
+    def _on_run_ramp_clicked(self) -> None:
+        if self._controller is None:
+            return
+        self._controller.request_run_ramp(
+            self.ramp_target.value(), self.ramp_step.value(), self.ramp_every.value()
+        )
+
+    def set_ramp_seeds(self, target, step, every) -> None:
+        """Pre-fill the manual ramp spinboxes from an imported regimen's seeds."""
+        if target is not None:
+            self.ramp_target.setValue(max(0, min(100, int(target))))
+        if step is not None:
+            self.ramp_step.setValue(max(1, min(50, int(step))))
+        if every is not None:
+            self.ramp_every.setValue(max(1, min(3600, int(every))))
 
     # -------- controller -> view --------
     def show_protocol(self, name: str, date: str, stage_count: int, est_total_s: float) -> None:
@@ -163,6 +207,9 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.pause_btn.setText("▶ Resume" if paused else "⏸ Pause")
         self.abort_btn.setEnabled(running or paused)
         self.reset_btn.setEnabled(terminal)
+        # Manual ramp controls share the lockout: usable only when not running.
+        for w in (self.ramp_target, self.ramp_step, self.ramp_every, self.run_ramp_btn):
+            w.setEnabled(not (running or paused))
 
 
 # ----------------------------------------------------------------------------
