@@ -86,7 +86,10 @@ def test_import_run_complete_with_lockout(_app, tmp_path):
     ros = _MockRos()
     tmill = _MockTreadmillPanel()
     panel = HiitPanel()
-    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None, clock=clk)
+    run_dir = tmp_path / "runs"
+    ctrl = HiitController(
+        ros, tmill, panel, log_fn=lambda m: None, clock=clk, run_log_dir=str(run_dir)
+    )
     panel.set_controller(ctrl)
 
     # import
@@ -114,6 +117,15 @@ def test_import_run_complete_with_lockout(_app, tmp_path):
     assert tmill._hiit_lock is False
     assert tmill.manual_enabled is True
     assert panel.reset_btn.isEnabled() is True
+
+    # a run-log was written with both stages and a complete outcome
+    import yaml
+    logs = list(run_dir.glob("hiit_run_*.yaml"))
+    assert len(logs) == 1
+    data = yaml.safe_load(logs[0].read_text(encoding="utf-8"))["hiit_run"]
+    assert data["outcome"] == "complete"
+    assert data["stage_count"] == 2
+    assert data["protocol_name"] == "Smoke"
 
 
 def test_pause_resume_and_abort(_app, tmp_path):

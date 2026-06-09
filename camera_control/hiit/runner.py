@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from .protocol import MAX_SPEED, MIN_SPEED, HiitProtocol, _ramp_time
+from .protocol import MAX_SPEED, MIN_SPEED, HiitProtocol, ResolvedStage, _ramp_time
 
 
 class HiitState(enum.Enum):
@@ -71,6 +71,7 @@ class HiitRunner:
         release_control: Callable[[], None] = _noop,
         on_state_change: Optional[Callable[[HiitState, HiitState], None]] = None,
         on_progress: Optional[Callable[[HiitProgress], None]] = None,
+        on_stage_change: Optional[Callable[[int, ResolvedStage], None]] = None,
         clock: Callable[[], float] = time.monotonic,
         tick_interval_s: float = 0.1,
         release_on_finish: bool = False,
@@ -85,6 +86,7 @@ class HiitRunner:
         self._release_control = release_control
         self._on_state_change = on_state_change
         self._on_progress = on_progress
+        self._on_stage_change = on_stage_change  # fired when a new stage is entered
         self._clock = clock
         self.tick_interval_s = tick_interval_s
         self.release_on_finish = release_on_finish
@@ -192,6 +194,8 @@ class HiitRunner:
         self._ramp_time = _ramp_time(self._seg_prev, self._seg_target, stage.ramp_rate)
         self._hold_end = self._ramp_time + stage.duration
         self._stage_start = start_time
+        if self._on_stage_change is not None:
+            self._on_stage_change(index, stage)
 
     def _service(self, now: float) -> None:
         stages = self.protocol.stages

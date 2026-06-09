@@ -302,3 +302,26 @@ def test_reset_rejected_while_running():
     r = h.make(_ramp_proto(5, 100, 5), FakeClock(0))
     r.start(0)
     assert r.reset() is False
+
+
+def test_on_stage_change_fires_per_stage():
+    events = []
+    clk = FakeClock(0)
+    data = {
+        "protocol_name": "t",
+        "steps": [
+            {"type": "run", "speed": 10, "duration": 1, "ramp_rate": 0},
+            {"type": "run", "speed": 20, "duration": 1, "ramp_rate": 0},
+        ],
+    }
+    proto = protocol_from_dict(data)
+    r = HiitRunner(
+        proto,
+        set_speed=lambda v: None,
+        on_stage_change=lambda i, s: events.append((i, s.speed, s.label)),
+        clock=clk,
+    )
+    r.start(0)
+    clk.set(100.0)
+    r.tick()
+    assert [(i, sp) for i, sp, _ in events] == [(0, 10), (1, 20)]

@@ -18,12 +18,15 @@ Wiring:
 
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
 from PySide6 import QtCore
 
 from . import protocol as protocol_mod
+from .runlog import RunLog
 from .runner import HiitProgress, HiitRunner, HiitState
 
 
@@ -36,6 +39,8 @@ class HiitController(QtCore.QObject):
         log_fn: Optional[Callable[[str], None]] = None,
         tick_ms: int = 100,
         clock: Optional[Callable[[], float]] = None,
+        enable_run_log: bool = True,
+        run_log_dir: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.ros = ros
@@ -43,7 +48,11 @@ class HiitController(QtCore.QObject):
         self.panel = panel
         self._log_fn = log_fn
         self._clock = clock  # injectable for headless/deterministic tests
+        self._mono = clock if clock is not None else time.monotonic
+        self.enable_run_log = enable_run_log
+        self.run_log_dir = run_log_dir
         self._runner: Optional[HiitRunner] = None
+        self._runlog: Optional[RunLog] = None
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(tick_ms)
@@ -78,6 +87,7 @@ class HiitController(QtCore.QObject):
             release_control=lambda: self._fire("release_control"),
             on_state_change=self._on_state_change,
             on_progress=self._on_progress,
+            on_stage_change=self._on_stage_change,
             tick_interval_s=self._timer.interval() / 1000.0,
             **({"clock": self._clock} if self._clock is not None else {}),
         )
@@ -98,6 +108,13 @@ class HiitController(QtCore.QObject):
             cmd = getattr(status, "commanded_speed_cm_s", -1)
             if isinstance(cmd, int) and cmd >= 0:
                 initial = cmd
+        # Begin a run-log before starting: start() fires the first stage event.
+        if self.enable_run_log:
+            proto = self._runner.protocol
+            self._runlog = RunLog(proto.protocol_name, proto.source_path, proto.estimated_total_s)
+            self._runlog.start(datetime.now(), self._mono())
+        else:
+            self._runlog = None
         if self._runner.start(initial_speed=initial):
             self._log(f"HIIT protocol started (from {initial} cm/s)")
 
@@ -153,10 +170,28 @@ class HiitController(QtCore.QObject):
         elif new in (HiitState.COMPLETE, HiitState.ABORTED):
             self._timer.stop()
             self._release_lock()
+            self._finalize_run_log(new)
         self._log(f"HIIT state: {old.value} -> {new.value}")
 
     def _on_progress(self, progress: HiitProgress) -> None:
         self.panel.apply_progress(progress)
+
+    def _on_stage_change(self, index: int, stage) -> None:
+        if self._runlog is not None:
+            self._runlog.stage_started(index, stage, datetime.now(), self._mono())
+
+    def _finalize_run_log(self, state: HiitState) -> None:
+        if self._runlog is None:
+            return
+        outcome = "complete" if state == HiitState.COMPLETE else "aborted"
+        self._runlog.finish(outcome, datetime.now(), self._mono())
+        try:
+            path = self._runlog.write(self.run_log_dir)
+            self._log(f"HIIT run-log written: {path}")
+        except Exception as exc:  # never let logging break the run teardown
+            self._log(f"HIIT run-log write FAILED: {exc}")
+        finally:
+            self._runlog = None
 
     # -------- mutual exclusion --------
     def _engage_lock(self) -> None:
