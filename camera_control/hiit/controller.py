@@ -130,7 +130,25 @@ class HiitController(QtCore.QObject):
                 return cmd
         return 0
 
-    def _build_and_start(self, proto) -> None:
+    def request_gentle_stop(self) -> None:
+        """Ease the belt to a stop at a fixed gentle decel — works whether or not
+        a protocol is running (it takes over an active run)."""
+        cur = self._current_initial_speed()
+        # Preserve the interrupted run's data before taking over.
+        if self._runner is not None and self._runner.state in (HiitState.RUNNING, HiitState.PAUSED):
+            self._close_run_log("gentle_stopped")
+        if cur <= 0:
+            # Already at zero: just make sure the belt is stopped and hand back.
+            self._timer.stop()
+            self._fire("stop")
+            self._release_lock()
+            self._runner = None
+            self._log("Gentle stop: belt already at 0 cm/s; sent stop")
+            return
+        self._build_and_start(protocol_mod.build_gentle_stop_protocol(), log=False)
+        self._log(f"Gentle stop: easing {cur} -> 0 cm/s")
+
+    def _build_and_start(self, proto, log: bool = True) -> None:
         self._runner = HiitRunner(
             proto,
             set_speed=self._sink_set_speed,
@@ -147,7 +165,7 @@ class HiitController(QtCore.QObject):
         initial = self._current_initial_speed()
         self._push_protocol_views(proto)
         # Begin a run-log before starting: start() fires the first stage event.
-        if self.enable_run_log:
+        if self.enable_run_log and log:
             self._runlog = RunLog(proto.protocol_name, proto.source_path, proto.estimated_total_s)
             self._runlog.start(datetime.now(), self._mono())
         else:
@@ -281,9 +299,11 @@ class HiitController(QtCore.QObject):
             self._runlog.stage_started(index, stage, datetime.now(), self._mono())
 
     def _finalize_run_log(self, state: HiitState) -> None:
+        self._close_run_log("complete" if state == HiitState.COMPLETE else "aborted")
+
+    def _close_run_log(self, outcome: str) -> None:
         if self._runlog is None:
             return
-        outcome = "complete" if state == HiitState.COMPLETE else "aborted"
         self._runlog.finish(outcome, datetime.now(), self._mono())
         target_dir = self.run_log_dir if self.run_log_dir is not None else hsettings.get_run_log_dir()
         try:

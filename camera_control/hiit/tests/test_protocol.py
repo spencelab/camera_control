@@ -251,6 +251,16 @@ def test_build_ramp_target_at_or_below_start():
     assert [s.speed for s in p.stages] == [20]
 
 
+def test_build_gentle_stop_protocol():
+    p = protocol.build_gentle_stop_protocol()
+    assert len(p.stages) == 1
+    assert p.stages[0].speed == 0
+    assert p.stages[0].ramp_rate == protocol.GENTLE_STOP_DECEL_CM_S2
+    # from 40 cm/s the decel takes 40/decel seconds
+    from hiit.protocol import _ramp_time
+    assert _ramp_time(40, 0, p.stages[0].ramp_rate) == pytest.approx(40 / protocol.GENTLE_STOP_DECEL_CM_S2)
+
+
 def test_build_ramp_rejects_bad_step_and_target():
     with pytest.raises(ValueError, match="step"):
         protocol.build_ramp_protocol(target=30, step=0, every=60)

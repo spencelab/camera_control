@@ -247,6 +247,48 @@ def test_telemetry_toggle_and_status_feed(_app):
     assert len(ctrl._telemetry_dialog.plot._cmd) >= 1
 
 
+def test_gentle_stop_standalone_eases_to_zero(_app, tmp_path):
+    clk = _FakeClock()
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    tmill.latest_status.commanded_speed_cm_s = 40  # belt running manually at 40
+    panel = HiitPanel()
+    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None, clock=clk,
+                          run_log_dir=str(tmp_path / "runs"))
+    panel.set_controller(ctrl)
+
+    assert panel.gentle_stop_btn.isEnabled()
+    ctrl.request_gentle_stop()  # no regimen loaded
+    assert ctrl._runner is not None
+    for t in [x * 0.5 for x in range(1, 60)]:
+        clk.set(t)
+        ctrl._on_tick()
+    assert ctrl._runner.state == HiitState.COMPLETE
+    assert tmill.speeds[-1] == 0
+    assert "stop" in ros.actions
+    # gentle stop does not write a run-log
+    assert not list((tmp_path / "runs").glob("*.yaml")) if (tmp_path / "runs").exists() else True
+
+
+def test_gentle_stop_button_enabled_during_run(_app, tmp_path):
+    clk = _FakeClock()
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    panel = HiitPanel()
+    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None, clock=clk,
+                          run_log_dir=str(tmp_path / "runs"))
+    panel.set_controller(ctrl)
+    ctrl.request_import(str(_write_protocol(tmp_path)))
+    ctrl.request_start()
+    clk.set(0.5); ctrl._on_tick()
+    assert panel.gentle_stop_btn.isEnabled()        # available mid-run
+    ctrl.request_gentle_stop()                       # takes over the running protocol
+    for t in [0.5 + x * 0.5 for x in range(1, 60)]:
+        clk.set(t); ctrl._on_tick()
+    assert ctrl._runner.state == HiitState.COMPLETE
+    assert tmill.speeds[-1] == 0
+
+
 def test_bad_file_shows_error_not_crash(_app, tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("protocol_name: x\nsteps:\n  - {type: run, speed: 999, duration: 1, ramp_rate: 1}\n", encoding="utf-8")

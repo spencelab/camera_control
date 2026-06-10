@@ -82,6 +82,8 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.ramp_every.setValue(60)
         self.ramp_every.setSuffix(" s")
         self.run_ramp_btn = QtWidgets.QPushButton("Run Ramp")
+        self.gentle_stop_btn = QtWidgets.QPushButton("Gentle Stop")
+        self.gentle_stop_btn.setToolTip("Ease the belt gradually to a stop (works any time).")
 
         # Colored phase scrubber (inline) + detachable-graph toggles.
         self.scrubber = PhaseScrubber()
@@ -111,6 +113,7 @@ class HiitPanel(QtWidgets.QGroupBox):
         ramp_row.addWidget(QtWidgets.QLabel("every"))
         ramp_row.addWidget(self.ramp_every)
         ramp_row.addWidget(self.run_ramp_btn)
+        ramp_row.addWidget(self.gentle_stop_btn)
         ramp_row.addStretch(1)
         self.ramp_group = QtWidgets.QGroupBox("Manual Ramp  (no regimen needed)")
         self.ramp_group.setLayout(ramp_row)
@@ -141,6 +144,7 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.abort_btn.clicked.connect(lambda: self._request("request_abort"))
         self.reset_btn.clicked.connect(lambda: self._request("request_reset"))
         self.run_ramp_btn.clicked.connect(self._on_run_ramp_clicked)
+        self.gentle_stop_btn.clicked.connect(lambda: self._request("request_gentle_stop"))
         self.profile_chk.toggled.connect(self._on_profile_toggled)
         self.telemetry_chk.toggled.connect(self._on_telemetry_toggled)
 
@@ -257,6 +261,8 @@ class HiitPanel(QtWidgets.QGroupBox):
         # Manual ramp controls share the lockout: usable only when not running.
         for w in (self.ramp_target, self.ramp_step, self.ramp_every, self.run_ramp_btn):
             w.setEnabled(not (running or paused))
+        # Gentle Stop is always available — it can halt an active run too.
+        self.gentle_stop_btn.setEnabled(True)
 
 
 # ----------------------------------------------------------------------------

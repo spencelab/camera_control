@@ -337,6 +337,24 @@ def build_ramp_protocol(
     )
 
 
+# Hardcoded gentle-stop deceleration (cm/s^2). ~9 s from 36 cm/s, ~25 s from 100.
+GENTLE_STOP_DECEL_CM_S2 = 4.0
+
+
+def build_gentle_stop_protocol(
+    decel: float = GENTLE_STOP_DECEL_CM_S2, name: str = "Gentle Stop"
+) -> HiitProtocol:
+    """A one-stage protocol that eases the belt from its current speed to 0 at a
+    fixed gentle deceleration (the runner ramps from the live commanded speed)."""
+    stage = ResolvedStage(0, 0.0, float(decel), "gentle stop", "gentle_stop")
+    return HiitProtocol(
+        protocol_name=name,
+        description=f"Gentle deceleration to 0 cm/s at {decel:g} cm/s².",
+        stages=(stage,),
+        estimated_total_s=0.0,
+    )
+
+
 # --------------------------
 # Plot / serialization helpers
 # --------------------------
