@@ -208,6 +208,45 @@ def test_import_seeds_ramp_spinboxes(_app, tmp_path):
     assert panel.ramp_every.value() == 90
 
 
+def test_new_controls_exist(_app):
+    panel = HiitPanel()
+    assert panel.create_btn is not None
+    assert panel.profile_chk is not None and panel.telemetry_chk is not None
+    assert panel.scrubber is not None
+
+
+def test_profile_graph_toggle_creates_and_hides(_app, tmp_path):
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    panel = HiitPanel()
+    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None)
+    panel.set_controller(ctrl)
+    ctrl.request_import(str(_write_protocol(tmp_path)))
+    # scrubber populated from the imported protocol
+    assert len(panel.scrubber._stages) == 2
+
+    ctrl.toggle_profile_graph(True)
+    assert ctrl._profile_dialog is not None
+    ctrl.toggle_profile_graph(False)
+    assert ctrl._profile_dialog.isVisible() is False
+
+
+def test_telemetry_toggle_and_status_feed(_app):
+    ros = _MockRos()
+    tmill = _MockTreadmillPanel()
+    panel = HiitPanel()
+    ctrl = HiitController(ros, tmill, panel, log_fn=lambda m: None)
+    panel.set_controller(ctrl)
+    ctrl.toggle_telemetry_graph(True)
+    assert ctrl._telemetry_dialog is not None
+
+    class _Msg:
+        commanded_speed_cm_s = 20
+        reported_speed_cm_s = 19
+    ctrl._on_status(_Msg())  # would normally arrive via status_changed
+    assert len(ctrl._telemetry_dialog.plot._cmd) >= 1
+
+
 def test_bad_file_shows_error_not_crash(_app, tmp_path):
     bad = tmp_path / "bad.yaml"
     bad.write_text("protocol_name: x\nsteps:\n  - {type: run, speed: 999, duration: 1, ramp_rate: 1}\n", encoding="utf-8")

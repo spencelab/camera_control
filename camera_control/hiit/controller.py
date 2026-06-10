@@ -26,6 +26,7 @@ from typing import Any, Callable, Optional
 from PySide6 import QtCore
 
 from . import protocol as protocol_mod
+from . import settings as hsettings
 from .runlog import RunLog
 from .runner import HiitProgress, HiitRunner, HiitState
 
@@ -54,10 +55,20 @@ class HiitController(QtCore.QObject):
         self._runner: Optional[HiitRunner] = None
         self._runlog: Optional[RunLog] = None
         self._loaded_protocol = None  # last imported phased regimen
+        self._profile_dialog = None
+        self._telemetry_dialog = None
 
         self._timer = QtCore.QTimer(self)
         self._timer.setInterval(tick_ms)
         self._timer.timeout.connect(self._on_tick)
+
+        # Forward treadmill status to the telemetry scope (no new subscription).
+        sc = getattr(treadmill_panel, "status_changed", None)
+        if sc is not None:
+            try:
+                sc.connect(self._on_status)
+            except Exception:
+                pass
 
     # -------- helpers --------
     def default_dir(self) -> Path:
@@ -87,6 +98,7 @@ class HiitController(QtCore.QObject):
         fn = getattr(self.panel, "set_ramp_seeds", None)
         if fn is not None:
             fn(proto.seed_target, proto.seed_step, proto.seed_every)
+        self._push_protocol_views(proto)
         self._log(
             f"HIIT regimen loaded: {proto.protocol_name} "
             f"({len(proto.stages)} stages, ~{proto.estimated_total_s:.0f}s)"
@@ -133,6 +145,7 @@ class HiitController(QtCore.QObject):
             **({"clock": self._clock} if self._clock is not None else {}),
         )
         initial = self._current_initial_speed()
+        self._push_protocol_views(proto)
         # Begin a run-log before starting: start() fires the first stage event.
         if self.enable_run_log:
             self._runlog = RunLog(proto.protocol_name, proto.source_path, proto.estimated_total_s)
@@ -160,6 +173,67 @@ class HiitController(QtCore.QObject):
         if self._runner is not None and self._runner.reset():
             self._log("HIIT protocol reset")
             self.panel.apply_progress(self._runner.current_progress())
+
+    def request_create_regimen(self) -> None:
+        """Open the interactive builder; optionally load the saved regimen."""
+        from .builder import RegimenBuilderDialog  # local import keeps panel import light
+
+        parent = self.panel.window() if hasattr(self.panel, "window") else None
+        dlg = RegimenBuilderDialog(parent)
+        if dlg.exec() and dlg.saved_path:
+            self._log(f"HIIT regimen saved: {dlg.saved_path}")
+            if dlg.load_after:
+                self.request_import(dlg.saved_path)
+
+    # -------- detachable graph windows --------
+    def toggle_profile_graph(self, on: bool) -> None:
+        from .graphs import ProfileGraphDialog
+
+        if on:
+            if self._profile_dialog is None:
+                self._profile_dialog = ProfileGraphDialog(self._dialog_parent())
+                self._profile_dialog.closed.connect(lambda: self.panel.set_profile_checked(False))
+            if self._loaded_protocol is not None:
+                self._profile_dialog.set_protocol(
+                    protocol_mod.speed_profile_points(self._loaded_protocol),
+                    self._loaded_protocol.estimated_total_s,
+                )
+            self._profile_dialog.show()
+            self._profile_dialog.raise_()
+        elif self._profile_dialog is not None:
+            self._profile_dialog.hide()
+
+    def toggle_telemetry_graph(self, on: bool) -> None:
+        from .graphs import TelemetryGraphDialog
+
+        if on:
+            if self._telemetry_dialog is None:
+                self._telemetry_dialog = TelemetryGraphDialog(parent=self._dialog_parent())
+                self._telemetry_dialog.closed.connect(lambda: self.panel.set_telemetry_checked(False))
+            self._telemetry_dialog.show()
+            self._telemetry_dialog.raise_()
+        elif self._telemetry_dialog is not None:
+            self._telemetry_dialog.hide()
+
+    def _dialog_parent(self):
+        return self.panel.window() if hasattr(self.panel, "window") else None
+
+    def _on_status(self, msg) -> None:
+        if self._telemetry_dialog is not None and self._telemetry_dialog.isVisible():
+            self._telemetry_dialog.add_sample(
+                self._mono(),
+                getattr(msg, "commanded_speed_cm_s", -1),
+                getattr(msg, "reported_speed_cm_s", -1),
+            )
+
+    def _push_protocol_views(self, proto) -> None:
+        fn = getattr(self.panel, "set_scrubber_stages", None)
+        if fn is not None:
+            fn([(s.duration, float(s.speed), s.label) for s in proto.stages])
+        if self._profile_dialog is not None:
+            self._profile_dialog.set_protocol(
+                protocol_mod.speed_profile_points(proto), proto.estimated_total_s
+            )
 
     # -------- runner sinks --------
     def _sink_set_speed(self, speed: int) -> None:
@@ -199,6 +273,8 @@ class HiitController(QtCore.QObject):
 
     def _on_progress(self, progress: HiitProgress) -> None:
         self.panel.apply_progress(progress)
+        if self._profile_dialog is not None and self._profile_dialog.isVisible():
+            self._profile_dialog.set_cursor(progress.total_elapsed_s)
 
     def _on_stage_change(self, index: int, stage) -> None:
         if self._runlog is not None:
@@ -209,8 +285,9 @@ class HiitController(QtCore.QObject):
             return
         outcome = "complete" if state == HiitState.COMPLETE else "aborted"
         self._runlog.finish(outcome, datetime.now(), self._mono())
+        target_dir = self.run_log_dir if self.run_log_dir is not None else hsettings.get_run_log_dir()
         try:
-            path = self._runlog.write(self.run_log_dir)
+            path = self._runlog.write(target_dir)
             self._log(f"HIIT run-log written: {path}")
         except Exception as exc:  # never let logging break the run teardown
             self._log(f"HIIT run-log write FAILED: {exc}")

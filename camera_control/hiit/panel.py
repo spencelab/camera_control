@@ -11,9 +11,11 @@ standalone on an MBP (see ``python3 -m hiit.panel``) with a mock controller.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import List, Optional, Tuple
 
 from PySide6 import QtCore, QtWidgets
+
+from .graphs import PhaseScrubber
 
 from .runner import HiitProgress, HiitState
 
@@ -45,6 +47,7 @@ class HiitPanel(QtWidgets.QGroupBox):
 
         # --- widgets ---
         self.import_btn = QtWidgets.QPushButton("⬆ Import Regimen…")
+        self.create_btn = QtWidgets.QPushButton("➕ Create New Regimen…")
         self.regimen_label = QtWidgets.QLabel(_REGIMEN_NONE_TEXT)
         self.regimen_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
         self.regimen_label.setStyleSheet(_REGIMEN_UNLOADED_STYLE)
@@ -80,9 +83,15 @@ class HiitPanel(QtWidgets.QGroupBox):
         self.ramp_every.setSuffix(" s")
         self.run_ramp_btn = QtWidgets.QPushButton("Run Ramp")
 
+        # Colored phase scrubber (inline) + detachable-graph toggles.
+        self.scrubber = PhaseScrubber()
+        self.profile_chk = QtWidgets.QCheckBox("📈 Profile graph")
+        self.telemetry_chk = QtWidgets.QCheckBox("📉 Commanded vs reported")
+
         # --- layout ---
         top = QtWidgets.QHBoxLayout()
         top.addWidget(self.import_btn)
+        top.addWidget(self.create_btn)
         top.addWidget(self.regimen_label, stretch=1)
 
         controls = QtWidgets.QHBoxLayout()
@@ -102,6 +111,11 @@ class HiitPanel(QtWidgets.QGroupBox):
         ramp_row.addWidget(self.run_ramp_btn)
         ramp_row.addStretch(1)
 
+        graphs_row = QtWidgets.QHBoxLayout()
+        graphs_row.addWidget(self.profile_chk)
+        graphs_row.addWidget(self.telemetry_chk)
+        graphs_row.addStretch(1)
+
         layout = QtWidgets.QVBoxLayout()
         layout.addLayout(top)
         layout.addLayout(controls)
@@ -109,17 +123,22 @@ class HiitPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.speed_label)
         layout.addWidget(self.stage_bar)
         layout.addWidget(self.overall_bar)
+        layout.addWidget(self.scrubber)
         layout.addWidget(self.time_label)
         layout.addLayout(ramp_row)
+        layout.addLayout(graphs_row)
         self.setLayout(layout)
 
         # --- signals ---
         self.import_btn.clicked.connect(self._on_import_clicked)
+        self.create_btn.clicked.connect(lambda: self._request("request_create_regimen"))
         self.run_btn.clicked.connect(lambda: self._request("request_start"))
         self.pause_btn.clicked.connect(lambda: self._request("request_toggle_pause"))
         self.abort_btn.clicked.connect(lambda: self._request("request_abort"))
         self.reset_btn.clicked.connect(lambda: self._request("request_reset"))
         self.run_ramp_btn.clicked.connect(self._on_run_ramp_clicked)
+        self.profile_chk.toggled.connect(self._on_profile_toggled)
+        self.telemetry_chk.toggled.connect(self._on_telemetry_toggled)
 
         self._set_buttons_for_state(HiitState.IDLE)
 
@@ -150,6 +169,28 @@ class HiitPanel(QtWidgets.QGroupBox):
         self._controller.request_run_ramp(
             self.ramp_target.value(), self.ramp_step.value(), self.ramp_every.value()
         )
+
+    def _on_profile_toggled(self, on: bool) -> None:
+        if self._controller is not None and hasattr(self._controller, "toggle_profile_graph"):
+            self._controller.toggle_profile_graph(on)
+
+    def _on_telemetry_toggled(self, on: bool) -> None:
+        if self._controller is not None and hasattr(self._controller, "toggle_telemetry_graph"):
+            self._controller.toggle_telemetry_graph(on)
+
+    def set_profile_checked(self, on: bool) -> None:
+        # keep checkbox in sync when a graph window is closed via its X
+        self.profile_chk.blockSignals(True)
+        self.profile_chk.setChecked(on)
+        self.profile_chk.blockSignals(False)
+
+    def set_telemetry_checked(self, on: bool) -> None:
+        self.telemetry_chk.blockSignals(True)
+        self.telemetry_chk.setChecked(on)
+        self.telemetry_chk.blockSignals(False)
+
+    def set_scrubber_stages(self, stages: List[Tuple[float, float, str]]) -> None:
+        self.scrubber.set_stages(stages)
 
     def set_ramp_seeds(self, target, step, every) -> None:
         """Pre-fill the manual ramp spinboxes from an imported regimen's seeds."""
@@ -188,6 +229,8 @@ class HiitPanel(QtWidgets.QGroupBox):
         overall_pct = int(100 * p.total_elapsed_s / p.total_estimated_s) if p.total_estimated_s > 0 else 0
         self.stage_bar.setValue(max(0, min(100, stage_pct)))
         self.overall_bar.setValue(max(0, min(100, overall_pct)))
+        frac = (p.stage_elapsed_s / p.stage_total_s) if p.stage_total_s > 0 else 0.0
+        self.scrubber.set_position(p.stage_index, frac)
         self.time_label.setText(
             f"Stage {p.stage_elapsed_s:.1f} / {p.stage_total_s:.1f} s   |   "
             f"Total {_fmt_mmss(p.total_elapsed_s)} / {_fmt_mmss(p.total_estimated_s)}"

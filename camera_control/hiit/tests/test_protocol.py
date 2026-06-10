@@ -256,3 +256,34 @@ def test_build_ramp_rejects_bad_step_and_target():
         protocol.build_ramp_protocol(target=30, step=0, every=60)
     with pytest.raises(ValueError, match="out of range"):
         protocol.build_ramp_protocol(target=101, step=5, every=60)
+
+
+# --------------------------
+# Plot / serialization helpers
+# --------------------------
+def test_speed_profile_points():
+    p = protocol_from_dict(
+        {"protocol_name": "t", "steps": [{"type": "run", "speed": 10, "duration": 5, "ramp_rate": 2}]}
+    )
+    assert protocol.speed_profile_points(p, start=0) == [(0.0, 0.0), (5.0, 10.0), (10.0, 10.0)]
+
+
+def test_to_yaml_document_roundtrip():
+    import yaml
+
+    data = {
+        "protocol_name": "RT",
+        "defaults": {"ramp_rate_cm_s2": 2},
+        "steps": [
+            {"type": "run", "speed": 10, "duration": 5, "ramp_rate": 1},
+            {"type": "loop", "count": 2, "steps": [{"type": "run", "speed": 20, "duration": 3, "ramp_rate": 0}]},
+        ],
+    }
+    doc = protocol.to_yaml_document(data, header="My Regimen\nLine 2")
+    assert doc.splitlines()[0].startswith("# My Regimen")
+    reloaded = yaml.safe_load(doc)
+    p1 = protocol_from_dict(reloaded)
+    p2 = protocol_from_dict(data)
+    assert [(s.speed, s.duration, s.ramp_rate) for s in p1.stages] == \
+           [(s.speed, s.duration, s.ramp_rate) for s in p2.stages]
+    assert len(p1.stages) == 3  # 1 + loop(2x1)

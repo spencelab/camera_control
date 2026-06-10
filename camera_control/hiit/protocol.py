@@ -335,3 +335,37 @@ def build_ramp_protocol(
         stages=stages_t,
         estimated_total_s=_estimated_total_s(stages_t),
     )
+
+
+# --------------------------
+# Plot / serialization helpers
+# --------------------------
+def speed_profile_points(protocol: HiitProtocol, start: int = 0) -> List[Tuple[float, float]]:
+    """Planned (time_s, speed_cm_s) polyline for the whole protocol.
+
+    Diagonal segments are ramps; horizontal segments are holds. Begins at
+    (0, start). Pure -> used by the profile graph and unit-testable.
+    """
+    pts: List[Tuple[float, float]] = [(0.0, float(start))]
+    t = 0.0
+    prev = start
+    for st in protocol.stages:
+        t += _ramp_time(prev, st.speed, st.ramp_rate)
+        pts.append((t, float(st.speed)))   # end of ramp
+        t += st.duration
+        pts.append((t, float(st.speed)))   # end of hold
+        prev = st.speed
+    return pts
+
+
+def to_yaml_document(data: Dict[str, Any], header: str = "") -> str:
+    """Serialize a protocol mapping to a YAML document with an optional header
+    comment block. The body uses the same flat schema the loader accepts.
+    """
+    import yaml  # type: ignore
+
+    body = yaml.safe_dump(data, sort_keys=False, default_flow_style=False, allow_unicode=True)
+    if header:
+        commented = "\n".join(f"# {ln}" if ln else "#" for ln in header.splitlines())
+        return commented + "\n\n" + body
+    return body
