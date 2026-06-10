@@ -41,7 +41,7 @@ class HiitPanel(QtWidgets.QGroupBox):
     """HIIT / phased trainer controls, mounted under the manual TreadmillPanel."""
 
     def __init__(self, controller=None, parent: Optional[QtWidgets.QWidget] = None):
-        super().__init__("HIIT / Phased Trainer", parent)
+        super().__init__("Automated Speed Controller", parent)
         self._controller = controller
         self._has_protocol = False
 
@@ -101,8 +101,10 @@ class HiitPanel(QtWidgets.QGroupBox):
         controls.addWidget(self.reset_btn)
         controls.addStretch(1)
 
+        # Manual ramp lives in its own group so it's usable as a standalone tool
+        # without importing or running any regimen.
         ramp_row = QtWidgets.QHBoxLayout()
-        ramp_row.addWidget(QtWidgets.QLabel("Manual ramp →"))
+        ramp_row.addWidget(QtWidgets.QLabel("Ramp to"))
         ramp_row.addWidget(self.ramp_target)
         ramp_row.addWidget(QtWidgets.QLabel("by"))
         ramp_row.addWidget(self.ramp_step)
@@ -110,6 +112,8 @@ class HiitPanel(QtWidgets.QGroupBox):
         ramp_row.addWidget(self.ramp_every)
         ramp_row.addWidget(self.run_ramp_btn)
         ramp_row.addStretch(1)
+        self.ramp_group = QtWidgets.QGroupBox("Manual Ramp  (no regimen needed)")
+        self.ramp_group.setLayout(ramp_row)
 
         graphs_row = QtWidgets.QHBoxLayout()
         graphs_row.addWidget(self.profile_chk)
@@ -125,7 +129,7 @@ class HiitPanel(QtWidgets.QGroupBox):
         layout.addWidget(self.overall_bar)
         layout.addWidget(self.scrubber)
         layout.addWidget(self.time_label)
-        layout.addLayout(ramp_row)
+        layout.addWidget(self.ramp_group)
         layout.addLayout(graphs_row)
         self.setLayout(layout)
 

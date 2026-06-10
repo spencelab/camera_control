@@ -40,7 +40,7 @@ camera_control/configs/hiit_protocols/example_hiit.yaml
 ## 3. Integration with the existing system
 
 ### 3.1 Mount point
-`MainWindow.__init__` constructs a `HiitController` and `HiitPanel` (guarded) and adds the panel beneath the existing `TreadmillPanel` on the Treadmill tab. No new tab, no change to tab ordering.
+`MainWindow.__init__` constructs a `HiitController` and `HiitPanel` (guarded) and adds the panel (titled **"Automated Speed Controller"**) beneath the existing `TreadmillPanel` on the Treadmill tab. No new tab, no change to tab ordering.
 
 ### 3.2 Command pipeline
 All belt commands route through the existing choke point **`TreadmillPanel.set_speed()`** (reusing its `[0,100]` clamp and spinbox/UI sync). Lifecycle actions use the existing `CameraControlRos.treadmill_trigger_async(...)`. The trainer adds **no new ROS publishers, subscribers, or services** — it consumes the `treadmill_control` interface already present:
@@ -67,7 +67,7 @@ Protocols are authored in YAML (see schema §5). On import the regimen is valida
 States: `IDLE → RUNNING → (PAUSED) → COMPLETE / ABORTED`. Per stage the belt **ramps** from the current commanded speed to the stage target at the stage's own `ramp_rate` (cm/s²; `0` = instant jump), then **holds** the target for `duration` seconds. Speeds are emitted as integer cm/s, de-duplicated, and clamped. Driven by a 10 Hz `QTimer` on the Qt thread (consistent with the app's existing single-threaded ROS spin). **Pause holds the current belt speed** and freezes the schedule; resume continues mid-stage. **Abort** zeroes speed and stops the belt. Time and all side-effects are injectable, making the engine fully unit-testable with a fake clock.
 
 ### 4.3 Manual Ramp Protocol
-A stepwise graded ramp (`target` / `step` / `every`) authored inline via spinboxes and run with one click. It is synthesized into a normal protocol and executed on the same engine, so it inherits the lockout, progress, and run-log. The spinboxes are seeded from an imported regimen's `target/step/every` values.
+A stepwise graded ramp (`target` / `step` / `every`) authored inline via spinboxes and run with one click. It lives in its own **"Manual Ramp (no regimen needed)"** sub-group and is fully **standalone** — operators can use it without importing or running any regimen, making it a general treadmill-control convenience independent of the HIIT workflow. It is synthesized into a normal protocol and executed on the same engine, so it inherits the lockout, progress, scrubber, and run-log. The spinboxes are seeded from an imported regimen's `target/step/every` values when one is loaded.
 
 ### 4.4 Interactive regimen builder (`RegimenBuilderDialog`)
 "➕ Create New Regimen" opens a form-based editor: header metadata + a tree of **run steps** and **"repeat ×N" groups** (the minimum that reproduces `example_hiit.yaml`), with add/edit/duplicate/delete/reorder. Edits validate live through the real schema (showing the same path-aware error messages the loader produces) and display computed stage count + duration. **Save** writes a schema-correct YAML (clean header comment + body) to a location chosen on the fly; **Save & Load** also activates it. Non-coders can author protocols without touching YAML; the output is identical to a hand-written file.
