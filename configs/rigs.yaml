@@ -44,9 +44,9 @@ rigs:
       - name: triggerbox_host
         command: "ros2 run triggerbox_ros2 triggerbox_host"
       - name: cam1
-        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"
       - name: cam2
-        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml"
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"
     shutdown_commands:
       - name: disable_trigger_output
         command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
@@ -66,7 +66,7 @@ rigs:
     camera_nodes: [cam1]
     processes:
       - name: cam1
-        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"
     shutdown_commands:
       - name: shutdown_cam1
         command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
@@ -82,7 +82,7 @@ rigs:
       - name: triggerbox_host
         command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig2"
       - name: cam1
-        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"
     shutdown_commands:
       - name: disable_trigger_output
         command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
@@ -102,9 +102,9 @@ rigs:
       - name: triggerbox_host
         command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig2"
       - name: cam1
-        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml"
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml"
       - name: cam2@10.0.0.2
-        command: "ssh -t spencelab@10.0.0.2 'ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -t spencelab@10.0.0.2 'ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
     shutdown_commands:
       - name: disable_trigger_output
         command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
@@ -134,23 +134,26 @@ rigs:
       - name: treadmill_host
         command: "ros2 run treadmill_control treadmill_host --ros-args -p enabled:=true -p auto_connect:=true"
       - name: cam1@cam1
-        command: "ssh -T spencelab@cam1 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -T spencelab@cam1 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
 
       - name: cam2@cam2
-        command: "ssh -T spencelab@cam2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -T spencelab@cam2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
 
       - name: cam3@cam3
-        command: "ssh -T spencelab@cam3 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam3 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam3_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -T spencelab@cam3 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam3 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
 
       - name: cam4@cam4
-        command: "ssh -T spencelab@cam4 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam4 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam4_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -T spencelab@cam4 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam4 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
 
       - name: cam5@cam5
-        command: "ssh -T spencelab@cam5 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam5 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam5_ximea_raw8mono_rolling_hwtrigger.yaml'"
+        command: "ssh -T spencelab@cam5 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam5 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_rolling_hwtrigger.yaml'"
 
     shutdown_commands:
-      - name: disable_triggerbox_output
-        command: "ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger '{}' || true"
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
 
       - name: shutdown_cam1
         command: "ssh -T spencelab@cam1 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam1 shutdown || true'"
@@ -167,5 +170,11 @@ rigs:
       - name: shutdown_cam5
         command: "ssh -T spencelab@cam5 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam5 shutdown || true'"
 
-      - name: shutdown_treadmill
-        command: "pkill -INT -f '[t]readmill_control.*treadmill_host' || true"
+      - name: stop_treadmill
+        command: "timeout 5s ros2 service call /treadmill_host/stop std_srvs/srv/Trigger '{}' || true"
+
+      - name: release_treadmill_control
+        command: "timeout 5s ros2 service call /treadmill_host/release_control std_srvs/srv/Trigger '{}' || true"
+
+      - name: kill_treadmill_host
+        command: "sleep 1; pkill -INT -f '[t]readmill_control.*treadmill_host' || true; sleep 2; pkill -TERM -f '[t]readmill_control.*treadmill_host' || true"
