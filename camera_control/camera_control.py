@@ -67,6 +67,15 @@ except Exception:
     HiitController = None
     HIIT_AVAILABLE = False
 
+# Optional processing tab. Kept in a separate module so pilot-day data tools do
+# not bloat the main camera cockpit.
+try:
+    from processing_panel import ProcessingPanel
+    PROCESSING_AVAILABLE = True
+except Exception:
+    ProcessingPanel = None
+    PROCESSING_AVAILABLE = False
+
 
 DISCOVERY_INTERVAL_MS = 1500
 STATUS_INTERVAL_MS = 1000
@@ -2235,6 +2244,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.process_manager.log_line.connect(self.append_log)
         self.system_panel = SystemPanel(self.process_manager, self.camera_panel)
 
+        self.processing_panel = None
+        if PROCESSING_AVAILABLE:
+            try:
+                self.processing_panel = ProcessingPanel()
+                self.processing_panel.log_line.connect(self.append_log)
+            except Exception as exc:
+                self.processing_panel = None
+                print(f"WARNING: Processing tab disabled: {exc}", file=sys.stderr)
+
         # Optional HIIT trainer (additive). Mounted under the manual treadmill
         # controls on the Treadmill tab; absent entirely if the package or its
         # deps are unavailable, leaving the existing GUI unchanged.
@@ -2282,6 +2300,9 @@ class MainWindow(QtWidgets.QMainWindow):
         treadmill_layout.addStretch(1)
         tab_treadmill.setLayout(treadmill_layout)
         self.tabs.addTab(tab_treadmill, "Treadmill")
+
+        if self.processing_panel is not None:
+            self.tabs.addTab(self.processing_panel, "Processing")
 
         tab_preview = QtWidgets.QWidget()
         preview_layout = QtWidgets.QVBoxLayout()
