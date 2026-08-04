@@ -114,3 +114,58 @@ rigs:
         command: "ssh -T spencelab@10.0.0.2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam2 shutdown || true'"
       - name: kill_triggerbox_host
         command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
+
+  - key: merb_tmill_5cams_tbox
+    label: merb_tmill_5cams_tbox
+    description: "Merb rig: tmill master with local triggerbox and remote cam1-cam5."
+    has_triggerbox: true
+    camera_nodes:
+      - cam1
+      - cam2
+      - cam3
+      - cam4
+      - cam5
+    configure_delay_ms: 6000
+    discover_delay_ms: 9000
+
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig2 --ros-args -p default_fps:=100.0"
+      - name: treadmill_host
+        command: "ros2 run treadmill_control treadmill_host --ros-args -p enabled:=true -p auto_connect:=true"
+      - name: cam1@cam1
+        command: "ssh -T spencelab@cam1 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam1_ximea_raw8mono_rolling_hwtrigger.yaml'"
+
+      - name: cam2@cam2
+        command: "ssh -T spencelab@cam2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam2 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam2_ximea_raw8mono_rolling_hwtrigger.yaml'"
+
+      - name: cam3@cam3
+        command: "ssh -T spencelab@cam3 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam3 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam3_ximea_raw8mono_rolling_hwtrigger.yaml'"
+
+      - name: cam4@cam4
+        command: "ssh -T spencelab@cam4 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam4 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam4_ximea_raw8mono_rolling_hwtrigger.yaml'"
+
+      - name: cam5@cam5
+        command: "ssh -T spencelab@cam5 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && exec ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam5 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/cam5_ximea_raw8mono_rolling_hwtrigger.yaml'"
+
+    shutdown_commands:
+      - name: disable_triggerbox_output
+        command: "ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger '{}' || true"
+
+      - name: shutdown_cam1
+        command: "ssh -T spencelab@cam1 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam1 shutdown || true'"
+
+      - name: shutdown_cam2
+        command: "ssh -T spencelab@cam2 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam2 shutdown || true'"
+
+      - name: shutdown_cam3
+        command: "ssh -T spencelab@cam3 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam3 shutdown || true'"
+
+      - name: shutdown_cam4
+        command: "ssh -T spencelab@cam4 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam4 shutdown || true'"
+
+      - name: shutdown_cam5
+        command: "ssh -T spencelab@cam5 'source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash && timeout 10s ros2 lifecycle set /cam5 shutdown || true'"
+
+      - name: shutdown_treadmill
+        command: "pkill -INT -f '[t]readmill_control.*treadmill_host' || true"
