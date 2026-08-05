@@ -820,8 +820,10 @@ class ProcessingPanel(QtWidgets.QWidget):
         cameras = cfg.get("cameras", ["cam1", "cam2", "cam3", "cam4", "cam5"])
         self.cameras_edit = QtWidgets.QLineEdit(" ".join(str(x) for x in cameras))
 
-        self.fps_spin = self._gain_spin(float(conv.get("fps", 5.0)))
+        self.fps_spin = self._gain_spin(0.0)
         self.fps_spin.setMaximum(10000.0)
+        self.fps_spin.setSingleStep(1.0)
+        self.fps_spin.setValue(float(conv.get("fps", 5.0)))
         self.r_spin = self._gain_spin(float(conv.get("r_gain", 1.23)))
         self.g_spin = self._gain_spin(float(conv.get("g_gain", 1.0)))
         self.b_spin = self._gain_spin(float(conv.get("b_gain", 1.60)))
