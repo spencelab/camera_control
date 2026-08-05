@@ -16,6 +16,7 @@ main camera cockpit does not grow another tentacle.
 from __future__ import annotations
 
 import os
+import signal
 import shlex
 import shutil
 import socket
@@ -270,6 +271,18 @@ if [[ -z "${{RAW}}" ]]; then
   exit 21
 fi
 META="${{RAW%_0000.cbrraw}}.metadata.yaml"
+if [[ ! -f "$META" ]]; then
+  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "{cam}_*.metadata.yaml" | sort | head -n 1)
+  if [[ -n "$META_BY_CAM" ]]; then
+    META="$META_BY_CAM"
+  fi
+fi
+if [[ ! -f "$META" ]]; then
+  META_ANY=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$META_ANY" ]]; then
+    META="$META_ANY"
+  fi
+fi
 PNG="$DIR/{cam}_first.png"
 if [[ ! -f "$META" ]]; then
   META=none
@@ -336,6 +349,7 @@ class PipelineJob:
 
 class PipelineWorker(QtCore.QObject):
     log = QtCore.Signal(str)
+    status = QtCore.Signal(str)
     progress = QtCore.Signal(int, int)
     finished = QtCore.Signal(str, int, int)
 
@@ -383,18 +397,27 @@ class PipelineWorker(QtCore.QObject):
         self.upload_port = str(upload_port or "").strip()
         self.upload_root = upload_root.rstrip("/")
         self._cancelled = False
+        self._current_proc: Optional[subprocess.Popen[str]] = None
 
     @QtCore.Slot()
     def cancel(self) -> None:
         self._cancelled = True
+        proc = self._current_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+                self.log.emit(f"Processing: sent SIGTERM to active process group pid={proc.pid}")
+            except Exception as exc:
+                self.log.emit(f"Processing: could not terminate active process pid={proc.pid}: {exc}")
 
     @QtCore.Slot()
     def run(self) -> None:
         action_plan = self._expand_action(self.action)
         jobs = [PipelineJob(session=s, cam=spec.cam, host=spec.host) for s in self.sessions for spec in self.camera_specs]
-        per_cam_steps = [a for a in action_plan if a != "upload_session"]
+        per_cam_steps = [a for a in action_plan if a not in ("upload_session", "delete_session_local")]
         session_upload_passes = 2 if "upload_session" in action_plan else 0
-        total = len(self.sessions) * session_upload_passes + len(jobs) * len(per_cam_steps)
+        session_delete_passes = 1 if "delete_session_local" in action_plan else 0
+        total = len(self.sessions) * (session_upload_passes + session_delete_passes) + len(jobs) * len(per_cam_steps)
         total = max(1, total)
         done = 0
         ok = 0
@@ -428,6 +451,14 @@ class PipelineWorker(QtCore.QObject):
                 done += 1
                 self.progress.emit(done, total)
 
+            # Final cleanup: remove local/control-machine session copy after
+            # all selected camera-host cleanup steps have run.
+            if (not self._cancelled) and "delete_session_local" in action_plan:
+                if self._delete_local_session_tree(session):
+                    ok += 1
+                done += 1
+                self.progress.emit(done, total)
+
         if self._cancelled:
             self.log.emit(f"Processing: action '{self.action}' cancelled")
         self.log.emit(f"Processing: action '{self.action}' complete: {ok}/{done} step(s) OK")
@@ -452,6 +483,8 @@ class PipelineWorker(QtCore.QObject):
             return ["verify_upload"]
         if action == "delete_uploaded_local":
             return ["delete_uploaded_local"]
+        if action == "delete_uploaded_session_local":
+            return ["delete_camera_session_local", "delete_session_local"]
         if action == "process_verify":
             return ["process", "verify"]
         if action == "upload_verify":
@@ -474,6 +507,45 @@ class PipelineWorker(QtCore.QObject):
         if _is_local_host(host):
             return self._run_local(["bash", "-lc", script], timeout_s=timeout_s)
         return self._run_local(["ssh", "-T", f"spencelab@{host}", script], timeout_s=timeout_s)
+
+    def _ssh_streaming(self, host: str, script: str, *, label: str) -> subprocess.CompletedProcess:
+        if _is_local_host(host):
+            argv = ["bash", "-lc", script]
+        else:
+            argv = ["ssh", "-T", f"spencelab@{host}", script]
+        return self._run_streaming(argv, label=label)
+
+    def _run_streaming(self, argv: List[str], *, label: str) -> subprocess.CompletedProcess:
+        lines: List[str] = []
+        proc: Optional[subprocess.Popen[str]] = None
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                start_new_session=True,
+            )
+            self._current_proc = proc
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                line = raw_line.rstrip()
+                lines.append(line)
+                if line:
+                    self.log.emit(f"Processing: {label}: {line}")
+                    if "[raw2mp4]" in line or "VERIFY" in line or "FRAME_" in line:
+                        self.status.emit(f"{label}: {line[:220]}")
+                if self._cancelled and proc.poll() is None:
+                    try:
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    except Exception:
+                        proc.terminate()
+            rc = proc.wait()
+            return subprocess.CompletedProcess(argv, rc, "\n".join(lines))
+        finally:
+            if proc is not None and self._current_proc is proc:
+                self._current_proc = None
 
     def _storage_spec(self) -> str:
         return f"{self.upload_user}@{self.upload_host}"
@@ -520,16 +592,144 @@ fi
 PREFIX="${{RAW%_0000.cbrraw}}"
 BASE="$(basename "$PREFIX")"
 META="${{PREFIX}}.metadata.yaml"
+if [[ ! -f "$META" ]]; then
+  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" | sort | head -n 1)
+  if [[ -n "$META_BY_CAM" ]]; then
+    META="$META_BY_CAM"
+  fi
+fi
+if [[ ! -f "$META" ]]; then
+  META_ANY=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$META_ANY" ]]; then
+    META="$META_ANY"
+  fi
+fi
 PROC_DIR="$DIR/$PROCESSED_SUBDIR"
 mkdir -p "$PROC_DIR"
 MP4="$PROC_DIR/${{BASE}}.mp4"
 AUDIT="$PROC_DIR/${{BASE}}.audit.csv"
 AUDIT_STDOUT="$PROC_DIR/${{BASE}}.audit.stdout.txt"
 INFO="$PROC_DIR/${{BASE}}.raw_info.txt"
+CONVERT_STDOUT="$PROC_DIR/${{BASE}}.convert.stdout.txt"
+CONVERT_ENV="$PROC_DIR/${{BASE}}.convert.env"
 VERIFY="$PROC_DIR/${{BASE}}.verify.env"
 if [[ ! -f "$META" ]]; then
   META=none
+else
+  echo "METADATA_USING $META"
 fi
+""".strip()
+
+    def _processed_base_snippet(self, job: PipelineJob) -> str:
+        """Snippet for steps that operate on processed outputs after raws may be deleted."""
+        return f"""
+set -eo pipefail
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+SESSION={_q(job.session)}
+CAM={_q(job.cam)}
+ROOT={_q(self.remote_sessions_root)}
+PROCESSED_SUBDIR={_q(self.processed_subdir)}
+DIR="$ROOT/$SESSION/$CAM"
+if [[ ! -d "$DIR" ]]; then
+  echo "NO_SESSION_DIR $DIR"
+  exit 20
+fi
+PROC_DIR="$DIR/$PROCESSED_SUBDIR"
+if [[ ! -d "$PROC_DIR" ]]; then
+  echo "NO_PROCESSED_DIR $PROC_DIR"
+  exit 22
+fi
+BASE=""
+VERIFY_OK=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.VERIFY_OK' | sort | head -n 1)
+if [[ -n "$VERIFY_OK" ]]; then
+  BASE="$(basename "${{VERIFY_OK%.VERIFY_OK}}")"
+fi
+if [[ -z "$BASE" ]]; then
+  PROCESS_ENV=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.process.env' | sort | head -n 1)
+  if [[ -n "$PROCESS_ENV" ]]; then
+    BASE="$(basename "${{PROCESS_ENV%.process.env}}")"
+  fi
+fi
+if [[ -z "$BASE" ]]; then
+  MP4_FIRST=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.mp4' | sort | head -n 1)
+  if [[ -n "$MP4_FIRST" ]]; then
+    BASE="$(basename "${{MP4_FIRST%.mp4}}")"
+  fi
+fi
+if [[ -z "$BASE" ]]; then
+  echo "NO_PROCESSED_BASE $PROC_DIR"
+  exit 23
+fi
+RAW=""
+PREFIX="$DIR/$BASE"
+META="$PROC_DIR/${{BASE}}.metadata.yaml"
+MP4="$PROC_DIR/${{BASE}}.mp4"
+AUDIT="$PROC_DIR/${{BASE}}.audit.csv"
+AUDIT_STDOUT="$PROC_DIR/${{BASE}}.audit.stdout.txt"
+INFO="$PROC_DIR/${{BASE}}.raw_info.txt"
+CONVERT_STDOUT="$PROC_DIR/${{BASE}}.convert.stdout.txt"
+CONVERT_ENV="$PROC_DIR/${{BASE}}.convert.env"
+VERIFY="$PROC_DIR/${{BASE}}.verify.env"
+echo "PROCESSED_BASE_USING $BASE"
+""".strip()
+
+    def _camera_session_snippet(self, job: PipelineJob) -> str:
+        """Snippet for final cleanup of a camera's local session directory.
+
+        This intentionally does not require raws or processed outputs. It is
+        used after upload verification, and must also work if processed/ has
+        already been removed by Delete local uploaded files.
+        """
+        return f"""
+set -eo pipefail
+SESSION={_q(job.session)}
+CAM={_q(job.cam)}
+ROOT={_q(self.remote_sessions_root)}
+PROCESSED_SUBDIR={_q(self.processed_subdir)}
+DIR="$ROOT/$SESSION/$CAM"
+PROC_DIR="$DIR/$PROCESSED_SUBDIR"
+if [[ ! -d "$DIR" ]]; then
+  echo "NO_SESSION_DIR $DIR"
+  exit 20
+fi
+""".strip()
+
+    def _script_delete_camera_session_local(self, job: PipelineJob) -> str:
+        return self._camera_session_snippet(job) + "\n\n" + """
+
+RAW_COUNT=$(find "$DIR" -maxdepth 1 -type f -name '*.cbrraw' | wc -l)
+if [[ "$RAW_COUNT" != "0" ]]; then
+  echo "REFUSING_DELETE_CAMERA_SESSION_WITH_RAW_FILES $DIR raw_count=$RAW_COUNT"
+  echo "Run Delete verified raws first."
+  exit 80
+fi
+
+# If processed/ still exists, require upload verification before deleting it.
+# If processed/ is already gone, this step is allowed so leftover metadata/png
+# crumbs can be removed after Delete local uploaded files.
+if [[ -d "$PROC_DIR" ]]; then
+  UPLOAD_OK=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.UPLOAD_VERIFY_OK' | sort | head -n 1)
+  if [[ -z "$UPLOAD_OK" ]]; then
+    echo "REFUSING_DELETE_CAMERA_SESSION_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR"
+    exit 81
+  fi
+fi
+
+BYTES=$(du -sb "$DIR" | awk '{print $1}')
+FILES=$(find "$DIR" -type f | wc -l)
+PARENT=$(dirname "$DIR")
+TOMBSTONE="$PARENT/${CAM}.LOCAL_CAMERA_SESSION_DELETED"
+cat > "$TOMBSTONE" <<EOF
+SESSION=$SESSION
+CAM=$CAM
+DIR=$DIR
+BYTES=$BYTES
+FILES=$FILES
+DELETED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+rm -rf "$DIR"
+echo "LOCAL_CAMERA_SESSION_DELETED $CAM bytes=$BYTES files=$FILES dir=$DIR"
 """.strip()
 
     def _script_info(self, job: PipelineJob) -> str:
@@ -564,7 +764,25 @@ echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC"
     def _script_process(self, job: PipelineJob) -> str:
         return self._remote_base_snippet(job) + "\n\n" + f"""
 
-ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$MP4" 0 {_q(self.fps)} "$META" {_q(self.r_gain)} {_q(self.g_gain)} {_q(self.b_gain)} {_q(self.gamma)}
+CONVERT_RC=0
+set +e
+ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$MP4" 0 {_q(self.fps)} "$META" {_q(self.r_gain)} {_q(self.g_gain)} {_q(self.b_gain)} {_q(self.gamma)} 2>&1 | tee "$CONVERT_STDOUT"
+CONVERT_RC=${{PIPESTATUS[0]}}
+set -e
+if [[ "$CONVERT_RC" != "0" ]]; then
+  exit "$CONVERT_RC"
+fi
+CONVERT_WRITTEN_FRAMES=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{{print $3}}')
+cat > "$CONVERT_ENV" <<EOF
+SESSION=$SESSION
+CAM=$CAM
+RAW=$RAW
+MP4=$MP4
+CONVERT_STDOUT=$CONVERT_STDOUT
+CONVERT_RC=$CONVERT_RC
+CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
+CONVERT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
 AUDIT_RC=0
 ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
 if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
@@ -582,10 +800,12 @@ RAW=$RAW
 MP4=$MP4
 AUDIT=$AUDIT
 AUDIT_RC=$AUDIT_RC
+CONVERT_STDOUT=$CONVERT_STDOUT
+CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
 FPS={self.fps}
 PROCESSED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-echo "PROCESSED $MP4 audit_rc=$AUDIT_RC"
+echo "PROCESSED $MP4 frames=${{CONVERT_WRITTEN_FRAMES:-unknown}} audit_rc=$AUDIT_RC"
 """.strip()
 
     def _script_verify(self, job: PipelineJob) -> str:
@@ -600,13 +820,40 @@ if [[ ! -s "$AUDIT" ]]; then
   exit 31
 fi
 RAW_FRAMES=$(grep -E '^# total_frames:' "$AUDIT" | tail -n 1 | awk '{print $3}')
-MP4_FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
-if [[ -z "$RAW_FRAMES" || -z "$MP4_FRAMES" || "$MP4_FRAMES" == "N/A" ]]; then
-  echo "FRAME_COUNT_UNKNOWN raw=$RAW_FRAMES mp4=$MP4_FRAMES"
+if [[ -z "$RAW_FRAMES" ]]; then
+  echo "FRAME_COUNT_UNKNOWN raw=$RAW_FRAMES"
   exit 32
 fi
-if [[ "$RAW_FRAMES" != "$MP4_FRAMES" ]]; then
-  echo "FRAME_MISMATCH raw=$RAW_FRAMES mp4=$MP4_FRAMES"
+CONVERT_WRITTEN=""
+if [[ -s "$CONVERT_ENV" ]]; then
+  CONVERT_WRITTEN=$(grep -E '^CONVERT_WRITTEN_FRAMES=' "$CONVERT_ENV" | tail -n 1 | cut -d= -f2-)
+fi
+if [[ -z "$CONVERT_WRITTEN" && -s "$CONVERT_STDOUT" ]]; then
+  CONVERT_WRITTEN=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{print $3}')
+fi
+MP4_FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+MP4_PACKETS=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+MP4_NB_FRAMES=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+FRAME_OK=0
+VERIFY_WARNING=""
+if [[ "$MP4_FRAMES" == "$RAW_FRAMES" ]]; then
+  FRAME_OK=1
+elif [[ "$MP4_PACKETS" == "$RAW_FRAMES" ]]; then
+  FRAME_OK=1
+  VERIFY_WARNING="nb_read_packets_matched_raw_frames mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS"
+elif [[ -n "$CONVERT_WRITTEN" && "$CONVERT_WRITTEN" == "$RAW_FRAMES" ]]; then
+  FRAME_OK=1
+  VERIFY_WARNING="converter_matched_raw_frames ffprobe_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=$CONVERT_WRITTEN"
+elif [[ "$MP4_FRAMES" =~ ^[0-9]+$ && "$RAW_FRAMES" =~ ^[0-9]+$ ]]; then
+  DELTA=$((MP4_FRAMES - RAW_FRAMES))
+  if (( DELTA < 0 )); then DELTA=$(( -DELTA )); fi
+  if (( DELTA <= 1 )); then
+    FRAME_OK=1
+    VERIFY_WARNING="ffprobe_off_by_${DELTA}_accepted raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
+  fi
+fi
+if [[ "$FRAME_OK" != "1" ]]; then
+  echo "FRAME_MISMATCH raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS nb_frames=$MP4_NB_FRAMES convert=${CONVERT_WRITTEN:-unknown}"
   exit 33
 fi
 META_CHECK="$META"
@@ -616,6 +863,11 @@ fi
 if [[ ! -s "$META_CHECK" ]]; then
   echo "MISSING_METADATA $META_CHECK"
   exit 34
+fi
+PROC_METADATA="$PROC_DIR/${BASE}.metadata.yaml"
+if [[ "$META_CHECK" != "$PROC_METADATA" ]]; then
+  cp -f "$META_CHECK" "$PROC_METADATA"
+  META_CHECK="$PROC_METADATA"
 fi
 MISSING=0
 for KEY in mode camera.width camera.height camera.fps camera.pixel_format output.kind; do
@@ -631,13 +883,21 @@ cat > "$VERIFY" <<EOF
 VERIFY_OK=1
 RAW_FRAMES=$RAW_FRAMES
 MP4_FRAMES=$MP4_FRAMES
+MP4_PACKETS=$MP4_PACKETS
+MP4_NB_FRAMES=$MP4_NB_FRAMES
+CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN
+VERIFY_WARNING=$VERIFY_WARNING
 MP4_SIZE_BYTES=$(stat -c %s "$MP4")
 AUDIT_SIZE_BYTES=$(stat -c %s "$AUDIT")
 METADATA=$META_CHECK
 VERIFIED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 touch "$PROC_DIR/${BASE}.VERIFY_OK"
-echo "VERIFY_OK $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES"
+if [[ -n "$VERIFY_WARNING" ]]; then
+  echo "VERIFY_OK_WITH_WARNING $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown} warning=$VERIFY_WARNING"
+else
+  echo "VERIFY_OK $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
+fi
 """.strip()
 
     def _script_delete_raws(self, job: PipelineJob) -> str:
@@ -655,7 +915,7 @@ echo "RAW_DELETED $CAM count=$COUNT"
 
     def _script_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
-        return self._remote_base_snippet(job) + "\n\n" + f"""
+        return self._processed_base_snippet(job) + "\n\n" + f"""
 
 {self._storage_shell_vars()}
 if [[ ! -f "$PROC_DIR/${{BASE}}.VERIFY_OK" ]]; then
@@ -671,7 +931,7 @@ echo "UPLOADED $CAM to $STORAGE:$DEST"
 
     def _script_verify_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
-        return self._remote_base_snippet(job) + "\n\n" + f"""
+        return self._processed_base_snippet(job) + "\n\n" + f"""
 
 {self._storage_shell_vars()}
 DEST={_q(upload_root)}/$SESSION/$CAM/processed
@@ -689,7 +949,7 @@ echo "UPLOAD_VERIFY_OK $CAM"
 """.strip()
 
     def _script_delete_uploaded_local(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + """
+        return self._processed_base_snippet(job) + "\n\n" + """
 
 if [[ ! -f "$PROC_DIR/${BASE}.UPLOAD_VERIFY_OK" ]]; then
   echo "REFUSING_DELETE_PROCESSED_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR/${BASE}.UPLOAD_VERIFY_OK"
@@ -717,6 +977,8 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             return self._script_verify_upload(job)
         if step == "delete_uploaded_local":
             return self._script_delete_uploaded_local(job)
+        if step == "delete_camera_session_local":
+            return self._script_delete_camera_session_local(job)
         raise ValueError(f"unknown processing step: {step}")
 
     def _append_manifest(self, session: str, cam: str, step: str, ok: bool, detail: str) -> None:
@@ -734,7 +996,7 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
         self.log.emit(f"Processing: {job.session}/{job.cam}: {step} on {job.host}")
         script = self._script_for_step(job, step)
         try:
-            proc = self._ssh(job.host, script, timeout_s=7200)
+            proc = self._ssh_streaming(job.host, script, label=f"{job.session}/{job.cam} {step}")
         except subprocess.TimeoutExpired:
             msg = f"TIMEOUT during {step}"
             self.log.emit(f"Processing: {job.session}/{job.cam}: {msg}")
@@ -797,6 +1059,95 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
         return ok
 
 
+    def _delete_local_session_tree(self, session: str) -> bool:
+        """Delete the controller/local copy of an uploaded session.
+
+        This refuses to remove local raw binaries. The raw cleanup path remains
+        Delete verified raws, so the final session cleanup cannot accidentally
+        discard unverified raw acquisition files.
+        """
+        local_dir = self.base_dir / session
+        storage = self._storage_spec()
+        remote_dir = f"{self.upload_root}/{session}"
+
+        if not local_dir.exists():
+            msg = f"LOCAL_SESSION_ALREADY_GONE {local_dir}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local OK: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", True, msg)
+            return True
+        if not local_dir.is_dir():
+            msg = f"LOCAL_SESSION_NOT_DIRECTORY {local_dir}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
+        raw_examples = sorted(local_dir.rglob("*.cbrraw"))[:5]
+        if raw_examples:
+            msg = "REFUSING_DELETE_SESSION_WITH_RAW_FILES " + " ".join(str(p) for p in raw_examples)
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
+        # Require that the session-level copy exists on storage before deleting
+        # the local folder. Camera processed files are guarded by per-camera
+        # UPLOAD_VERIFY_OK checks before their directories can be removed.
+        check_cmd = f"test -s {_q(remote_dir + '/session.yaml')}"
+        check = self._run_local(["ssh"] + self._storage_ssh_argv() + [storage, check_cmd], timeout_s=60)
+        if check.returncode != 0:
+            msg = f"REFUSING_DELETE_SESSION_STORAGE_MISSING {storage}:{remote_dir}/session.yaml {_tail(check.stdout, 4)}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
+        file_count = 0
+        byte_count = 0
+        for p in local_dir.rglob("*"):
+            if p.is_file():
+                file_count += 1
+                try:
+                    byte_count += p.stat().st_size
+                except OSError:
+                    pass
+
+        report = local_dir / "LOCAL_SESSION_DELETED.txt"
+        report.write_text(
+            "\n".join([
+                f"SESSION={session}",
+                f"LOCAL_DIR={local_dir}",
+                f"STORAGE={storage}:{remote_dir}",
+                f"CAMERA_MAP={' '.join(self.cameras)}",
+                f"BYTES={byte_count}",
+                f"FILES={file_count}",
+                f"DELETED_UTC={datetime.utcnow().isoformat(timespec='seconds')}Z",
+                "",
+            ]),
+            encoding="utf-8",
+        )
+        self._append_manifest(
+            session,
+            "tmill",
+            "delete_session_local",
+            True,
+            f"DELETE_READY bytes={byte_count} files={file_count} storage={storage}:{remote_dir}",
+        )
+
+        upload_items = [report]
+        manifest = local_dir / self.manifest_name
+        if manifest.exists():
+            upload_items.append(manifest)
+        argv = ["rsync", "-a", "--partial"] + self._storage_rsync_argv() + [str(p) for p in upload_items] + [f"{storage}:{remote_dir}/"]
+        proc = self._run_local(argv, timeout_s=300)
+        if proc.returncode != 0:
+            msg = f"DELETE_REPORT_UPLOAD_FAILED rc={proc.returncode}: {_tail(proc.stdout, 8)}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
+        shutil.rmtree(local_dir)
+        self.log.emit(f"Processing: {session}/tmill: delete_session_local OK: deleted {local_dir} bytes={byte_count} files={file_count}")
+        return True
+
+
 class ProcessingPanel(QtWidgets.QWidget):
     """Processing tab for pilot-day thumbnail, conversion, verification, and upload."""
 
@@ -848,6 +1199,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_btn = QtWidgets.QPushButton("Upload processed")
         self.verify_upload_btn = QtWidgets.QPushButton("Verify upload")
         self.delete_uploaded_local_btn = QtWidgets.QPushButton("Delete local uploaded files")
+        self.delete_uploaded_session_local_btn = QtWidgets.QPushButton("Delete uploaded session copies")
         self.process_verify_btn = QtWidgets.QPushButton("Process + verify")
         self.upload_verify_btn = QtWidgets.QPushButton("Upload + verify")
         self.process_to_upload_btn = QtWidgets.QPushButton("Process + verify + upload")
@@ -878,6 +1230,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_btn.clicked.connect(lambda: self.run_pipeline("upload"))
         self.verify_upload_btn.clicked.connect(lambda: self.run_pipeline("verify_upload"))
         self.delete_uploaded_local_btn.clicked.connect(lambda: self.run_pipeline("delete_uploaded_local"))
+        self.delete_uploaded_session_local_btn.clicked.connect(lambda: self.run_pipeline("delete_uploaded_session_local"))
         self.process_verify_btn.clicked.connect(lambda: self.run_pipeline("process_verify"))
         self.upload_verify_btn.clicked.connect(lambda: self.run_pipeline("upload_verify"))
         self.process_to_upload_btn.clicked.connect(lambda: self.run_pipeline("process_verify_upload"))
@@ -938,6 +1291,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         buttons2.addWidget(self.upload_btn)
         buttons2.addWidget(self.verify_upload_btn)
         buttons2.addWidget(self.delete_uploaded_local_btn)
+        buttons2.addWidget(self.delete_uploaded_session_local_btn)
         buttons2.addStretch(1)
 
         buttons3 = QtWidgets.QHBoxLayout()
@@ -952,7 +1306,8 @@ class ProcessingPanel(QtWidgets.QWidget):
             "Heavy processing runs on each camera host. Cameras upload their processed files directly to storage. "
             "tmill uploads session.yaml, thumbnails, processing_manifest.tsv, and rosbag/ if present. "
             "Run raw info/audit writes non-destructive diagnostics into each camera processed/ folder. "
-            "Delete buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files."
+            "Delete buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files. "
+            "Delete uploaded session copies removes selected local session folders after upload verification and refuses if raw binaries remain."
         )
         hint.setWordWrap(True)
 
@@ -981,8 +1336,8 @@ class ProcessingPanel(QtWidgets.QWidget):
             self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
             self.audit_btn, self.info_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
-            self.delete_uploaded_local_btn, self.process_verify_btn,
-            self.upload_verify_btn, self.process_to_upload_btn,
+            self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn,
+            self.process_verify_btn, self.upload_verify_btn, self.process_to_upload_btn,
         ]:
             widget.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
@@ -1049,6 +1404,23 @@ class ProcessingPanel(QtWidgets.QWidget):
             self.status_label.setText("No camera hosts/nodes configured.")
             return
 
+        if action == "delete_uploaded_session_local":
+            session_text = ", ".join(sessions[:5])
+            if len(sessions) > 5:
+                session_text += f", ... ({len(sessions)} total)"
+            reply = QtWidgets.QMessageBox.warning(
+                self,
+                "Delete uploaded session copies?",
+                "This permanently deletes the selected local session folder(s) and camera-host session folder(s) after upload checks.\n\n"
+                "It refuses to continue if .cbrraw files remain.\n\n"
+                f"Sessions: {session_text}",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.status_label.setText("Session cleanup cancelled.")
+                return
+
         self.progress.setRange(0, max(1, len(sessions) * len(cameras)))
         self.progress.setValue(0)
         self.status_label.setText(f"Running {action} for {len(sessions)} sessions x {len(cameras)} cameras...")
@@ -1081,6 +1453,8 @@ class ProcessingPanel(QtWidgets.QWidget):
         worker.moveToThread(self._thread)
         self._thread.started.connect(start_slot)
         worker.log.connect(self.log_line.emit)  # type: ignore[attr-defined]
+        if hasattr(worker, "status"):
+            worker.status.connect(self.status_label.setText)  # type: ignore[attr-defined]
         worker.progress.connect(self._on_progress)  # type: ignore[attr-defined]
         finished_signal.connect(finished_slot)
         finished_signal.connect(self._thread.quit)
@@ -1092,7 +1466,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         if self._worker is not None and hasattr(self._worker, "cancel"):
             self._worker.cancel()  # type: ignore[attr-defined]
             self.cancel_btn.setEnabled(False)
-            self.status_label.setText("Cancelling after current remote command...")
+            self.status_label.setText("Cancelling active local/SSH command...")
 
     @QtCore.Slot(int, int)
     def _on_progress(self, done: int, total: int) -> None:
