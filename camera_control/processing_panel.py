@@ -436,6 +436,12 @@ class PipelineWorker(QtCore.QObject):
     def _expand_action(self, action: str) -> List[str]:
         if action == "process":
             return ["process"]
+        if action == "info":
+            return ["info"]
+        if action == "audit":
+            return ["audit"]
+        if action == "info_audit":
+            return ["info", "audit"]
         if action == "verify":
             return ["verify"]
         if action == "delete_raws":
@@ -524,6 +530,35 @@ VERIFY="$PROC_DIR/${{BASE}}.verify.env"
 if [[ ! -f "$META" ]]; then
   META=none
 fi
+""".strip()
+
+    def _script_info(self, job: PipelineJob) -> str:
+        return self._remote_base_snippet(job) + "\n\n" + """
+
+ros2 run cambuffer_recorder_ng raw_rolling_info "$RAW" > "$INFO" 2>&1
+echo "RAW_INFO_WRITTEN $INFO"
+""".strip()
+
+    def _script_audit(self, job: PipelineJob) -> str:
+        return self._remote_base_snippet(job) + "\n\n" + f"""
+
+AUDIT_RC=0
+ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
+if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
+  cat "$AUDIT_STDOUT"
+  exit "$AUDIT_RC"
+fi
+cat > "$PROC_DIR/${{BASE}}.audit.env" <<EOF
+SESSION=$SESSION
+CAM=$CAM
+RAW=$RAW
+AUDIT=$AUDIT
+AUDIT_STDOUT=$AUDIT_STDOUT
+AUDIT_RC=$AUDIT_RC
+FPS={self.fps}
+AUDIT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC"
 """.strip()
 
     def _script_process(self, job: PipelineJob) -> str:
@@ -635,15 +670,15 @@ echo "UPLOADED $CAM to $STORAGE:$DEST"
 """.strip()
 
     def _script_verify_upload(self, job: PipelineJob) -> str:
-        storage = self._storage_spec()
         upload_root = self.upload_root
         return self._remote_base_snippet(job) + "\n\n" + f"""
 
+{self._storage_shell_vars()}
 DEST={_q(upload_root)}/$SESSION/$CAM/processed
 LOCAL_LIST=$(mktemp)
 REMOTE_LIST=$(mktemp)
 (cd "$PROC_DIR" && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' -printf '%P\t%s\n' | sort) > "$LOCAL_LIST"
-ssh {_q(storage)} "cd '$DEST' && find . -type f -printf '%P\t%s\n' | sort" > "$REMOTE_LIST"
+ssh "${{SSH_ARGS[@]}}" "$STORAGE" "cd '$DEST' && find . -type f -printf '%P\t%s\n' | sort" > "$REMOTE_LIST"
 if ! diff -u "$LOCAL_LIST" "$REMOTE_LIST"; then
   echo "UPLOAD_SIZE_VERIFY_FAILED $CAM"
   exit 60
@@ -668,6 +703,10 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
     def _script_for_step(self, job: PipelineJob, step: str) -> str:
         if step == "process":
             return self._script_process(job)
+        if step == "info":
+            return self._script_info(job)
+        if step == "audit":
+            return self._script_audit(job)
         if step == "verify":
             return self._script_verify(job)
         if step == "delete_raws":
@@ -799,6 +838,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.refresh_btn = QtWidgets.QPushButton("Refresh sessions")
         self.create_btn = QtWidgets.QPushButton("Create and copy thumbnails")
         self.process_btn = QtWidgets.QPushButton("Process raws")
+        self.info_btn = QtWidgets.QPushButton("Run raw info")
+        self.audit_btn = QtWidgets.QPushButton("Run raw audit")
+        self.info_audit_btn = QtWidgets.QPushButton("Info + audit")
         self.verify_btn = QtWidgets.QPushButton("Verify processed")
         self.delete_raws_btn = QtWidgets.QPushButton("Delete verified raws")
         self.upload_btn = QtWidgets.QPushButton("Upload processed")
@@ -826,6 +868,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.refresh_btn.clicked.connect(self.refresh_sessions)
         self.create_btn.clicked.connect(self.create_thumbnails)
         self.process_btn.clicked.connect(lambda: self.run_pipeline("process"))
+        self.info_btn.clicked.connect(lambda: self.run_pipeline("info"))
+        self.audit_btn.clicked.connect(lambda: self.run_pipeline("audit"))
+        self.info_audit_btn.clicked.connect(lambda: self.run_pipeline("info_audit"))
         self.verify_btn.clicked.connect(lambda: self.run_pipeline("verify"))
         self.delete_raws_btn.clicked.connect(lambda: self.run_pipeline("delete_raws"))
         self.upload_btn.clicked.connect(lambda: self.run_pipeline("upload"))
@@ -880,6 +925,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         buttons1.addWidget(self.refresh_btn)
         buttons1.addWidget(self.create_btn)
         buttons1.addWidget(self.process_btn)
+        buttons1.addWidget(self.info_btn)
+        buttons1.addWidget(self.audit_btn)
+        buttons1.addWidget(self.info_audit_btn)
         buttons1.addWidget(self.verify_btn)
         buttons1.addWidget(self.delete_raws_btn)
         buttons1.addStretch(1)
@@ -901,6 +949,7 @@ class ProcessingPanel(QtWidgets.QWidget):
             "Camera map examples: cam1@local for one-box testing, or cam1@cam1 cam2@cam2 ... for MERB. "
             "Heavy processing runs on each camera host. Cameras upload their processed files directly to storage. "
             "tmill uploads session.yaml, thumbnails, processing_manifest.tsv, and rosbag/ if present. "
+            "Run raw info/audit writes non-destructive diagnostics into each camera processed/ folder. "
             "Delete buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files."
         )
         hint.setWordWrap(True)
@@ -927,7 +976,8 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     def _set_busy(self, busy: bool) -> None:
         for widget in [
-            self.refresh_btn, self.create_btn, self.process_btn, self.verify_btn,
+            self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
+            self.audit_btn, self.info_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
             self.delete_uploaded_local_btn, self.process_verify_btn,
             self.upload_verify_btn, self.process_to_upload_btn,
