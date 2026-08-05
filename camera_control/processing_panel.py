@@ -527,7 +527,7 @@ fi
 """.strip()
 
     def _script_process(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + f"""
+        return self._remote_base_snippet(job) + "\n\n" + f"""
 
 ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$MP4" 0 {_q(self.fps)} "$META" {_q(self.r_gain)} {_q(self.g_gain)} {_q(self.b_gain)} {_q(self.gamma)}
 AUDIT_RC=0
@@ -554,7 +554,7 @@ echo "PROCESSED $MP4 audit_rc=$AUDIT_RC"
 """.strip()
 
     def _script_verify(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + """
+        return self._remote_base_snippet(job) + "\n\n" + """
 
 if [[ ! -s "$MP4" ]]; then
   echo "MISSING_MP4 $MP4"
@@ -606,7 +606,7 @@ echo "VERIFY_OK $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES"
 """.strip()
 
     def _script_delete_raws(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + """
+        return self._remote_base_snippet(job) + "\n\n" + """
 
 if [[ ! -f "$PROC_DIR/${BASE}.VERIFY_OK" ]]; then
   echo "REFUSING_DELETE_RAW_WITHOUT_VERIFY_OK $PROC_DIR/${BASE}.VERIFY_OK"
@@ -620,7 +620,7 @@ echo "RAW_DELETED $CAM count=$COUNT"
 
     def _script_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
-        return self._remote_base_snippet(job) + f"""
+        return self._remote_base_snippet(job) + "\n\n" + f"""
 
 {self._storage_shell_vars()}
 if [[ ! -f "$PROC_DIR/${{BASE}}.VERIFY_OK" ]]; then
@@ -637,7 +637,7 @@ echo "UPLOADED $CAM to $STORAGE:$DEST"
     def _script_verify_upload(self, job: PipelineJob) -> str:
         storage = self._storage_spec()
         upload_root = self.upload_root
-        return self._remote_base_snippet(job) + f"""
+        return self._remote_base_snippet(job) + "\n\n" + f"""
 
 DEST={_q(upload_root)}/$SESSION/$CAM/processed
 LOCAL_LIST=$(mktemp)
@@ -654,7 +654,7 @@ echo "UPLOAD_VERIFY_OK $CAM"
 """.strip()
 
     def _script_delete_uploaded_local(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + """
+        return self._remote_base_snippet(job) + "\n\n" + """
 
 if [[ ! -f "$PROC_DIR/${BASE}.UPLOAD_VERIFY_OK" ]]; then
   echo "REFUSING_DELETE_PROCESSED_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR/${BASE}.UPLOAD_VERIFY_OK"

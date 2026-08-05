@@ -1,0 +1,40 @@
+processing:
+  local_sessions_root: "/home/spencelab/camera_sessions"
+  remote_sessions_root: "/home/spencelab/camera_sessions"
+
+  # Camera map entries are <camera_dir>@<host>.
+  # For one-box testing on ros2test, use:
+  #   - cam1@local
+  # For MERB, use cam1@cam1 ... cam5@cam5.
+  cameras:
+    - cam1@cam1
+    - cam2@cam2
+    - cam3@cam3
+    - cam4@cam4
+    - cam5@cam5
+
+  processed_subdir: "processed"
+  thumbnails_subdir: "thumbnails"
+  manifest_name: "processing_manifest.tsv"
+
+  conversion:
+    fps: 5.0
+    r_gain: 1.23
+    g_gain: 1.00
+    b_gain: 1.60
+    gamma: 1.0
+    audit_threshold_frames: 1.5
+
+  upload:
+    # Host can be a LAN alias, public DNS name, or IP address.
+    host: "gpu2"
+    user: "spencelab"
+    # Leave empty for the default SSH port 22. Use a string for custom ports.
+    port: ""
+    root: "/zfstank3/storage/camera_sessions_uploads"
+    verify: "size"
+    max_parallel_uploads: 1
+
+  rosbag:
+    subdir: "rosbag"
+    upload_from: "tmill"
