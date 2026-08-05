@@ -10,7 +10,7 @@ processing:
     - cam5@cam5
 
   conversion:
-    fps: 5.0
+    fps: 10.0
     r_gain: 1.23
     g_gain: 1.00
     b_gain: 1.60

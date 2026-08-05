@@ -33,15 +33,61 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
 
+def _configs_dir() -> Path:
+    return _repo_root() / "configs"
+
+
 def _default_processing_config_path() -> Path:
-    return Path(os.environ.get(
-        "CAMERA_CONTROL_PROCESSING_YAML",
-        str(_repo_root() / "configs" / "processing.yaml"),
-    )).expanduser()
+    env = os.environ.get("CAMERA_CONTROL_PROCESSING_YAML", "").strip()
+    if env:
+        return Path(env).expanduser()
+    return _configs_dir() / "processing.yaml"
 
 
-def _load_processing_config() -> Dict[str, Any]:
-    """Load optional processing.yaml, returning permissive defaults if absent."""
+def _processing_config_candidates() -> List[Path]:
+    """Return available processing profile YAMLs, de-duplicated.
+
+    Convention:
+      configs/processing*.yaml
+
+    Examples:
+      processing.yaml
+      processing_merb.yaml
+      processing_ros2test.yaml
+      processing_dimroom.yaml
+    """
+    candidates: List[Path] = []
+
+    env = os.environ.get("CAMERA_CONTROL_PROCESSING_YAML", "").strip()
+    if env:
+        candidates.append(Path(env).expanduser())
+
+    cfg_dir = _configs_dir()
+    if cfg_dir.is_dir():
+        candidates.extend(sorted(cfg_dir.glob("processing*.yaml")))
+
+    candidates.append(_default_processing_config_path())
+
+    out: List[Path] = []
+    seen = set()
+    for path in candidates:
+        key = str(path.expanduser())
+        if key not in seen:
+            out.append(path.expanduser())
+            seen.add(key)
+    return out
+
+
+def _remembered_processing_config_path() -> Path:
+    settings = QtCore.QSettings("SpenceLab", "camera_control")
+    remembered = str(settings.value("processing/config_path", "") or "").strip()
+    if remembered:
+        return Path(remembered).expanduser()
+    return _default_processing_config_path()
+
+
+def _load_processing_config(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Load optional processing YAML, returning permissive defaults if absent."""
     defaults: Dict[str, Any] = {
         "processing": {
             "local_sessions_root": str(Path.home() / "camera_sessions"),
@@ -73,13 +119,13 @@ def _load_processing_config() -> Dict[str, Any]:
         }
     }
 
-    path = _default_processing_config_path()
-    if not path.exists():
+    cfg_path = (path or _default_processing_config_path()).expanduser()
+    if not cfg_path.exists():
         return defaults
 
     try:
         import yaml  # type: ignore
-        loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
         if not isinstance(loaded, dict):
             return defaults
 
@@ -1157,7 +1203,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[QtCore.QObject] = None
-        cfg = _load_processing_config().get("processing", {})
+        self.settings = QtCore.QSettings("SpenceLab", "camera_control")
+        self.processing_config_path = _remembered_processing_config_path()
+        cfg = _load_processing_config(self.processing_config_path).get("processing", {})
         conv = cfg.get("conversion", {}) if isinstance(cfg.get("conversion"), dict) else {}
         upload = cfg.get("upload", {}) if isinstance(cfg.get("upload"), dict) else {}
 
@@ -1188,7 +1236,12 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_port_edit.setMaximumWidth(80)
         self.upload_root_edit = QtWidgets.QLineEdit(str(upload.get("root", "/zfstank3/storage/camera_sessions_uploads")))
 
-        self.load_config_btn = QtWidgets.QPushButton("Load processing.yaml")
+        self.processing_profile_combo = QtWidgets.QComboBox()
+        self.processing_profile_combo.setMinimumWidth(280)
+        self.reload_profiles_btn = QtWidgets.QPushButton("Refresh profiles")
+        self.load_config_btn = QtWidgets.QPushButton("Load selected processing YAML")
+        self._populate_processing_profile_combo()
+
         self.refresh_btn = QtWidgets.QPushButton("Refresh sessions")
         self.create_btn = QtWidgets.QPushButton("Create and copy thumbnails")
         self.process_btn = QtWidgets.QPushButton("Process raws")
@@ -1220,7 +1273,9 @@ class ProcessingPanel(QtWidgets.QWidget):
 
         self._build_layout()
 
-        self.load_config_btn.clicked.connect(self.load_processing_yaml)
+        self.processing_profile_combo.currentIndexChanged.connect(self._processing_profile_changed)
+        self.reload_profiles_btn.clicked.connect(self.refresh_processing_profiles)
+        self.load_config_btn.clicked.connect(self.load_selected_processing_yaml)
         self.refresh_btn.clicked.connect(self.refresh_sessions)
         self.create_btn.clicked.connect(self.create_thumbnails)
         self.process_btn.clicked.connect(lambda: self.run_pipeline("process"))
@@ -1278,8 +1333,13 @@ class ProcessingPanel(QtWidgets.QWidget):
         upload.addWidget(self.upload_root_edit, stretch=1)
         top.addRow("Storage upload", upload)
 
+        profile = QtWidgets.QHBoxLayout()
+        profile.addWidget(self.processing_profile_combo, stretch=1)
+        profile.addWidget(self.load_config_btn)
+        profile.addWidget(self.reload_profiles_btn)
+        top.addRow("Processing YAML", profile)
+
         buttons1 = QtWidgets.QHBoxLayout()
-        buttons1.addWidget(self.load_config_btn)
         buttons1.addWidget(self.refresh_btn)
         buttons1.addWidget(self.create_btn)
         buttons1.addWidget(self.process_btn)
@@ -1334,6 +1394,47 @@ class ProcessingPanel(QtWidgets.QWidget):
         names = [x.strip() for x in self.cameras_edit.text().replace(",", " ").split()]
         return [x for x in names if x]
 
+    def _profile_label(self, path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(_repo_root()))
+        except Exception:
+            return str(path)
+
+    def _populate_processing_profile_combo(self) -> None:
+        current = Path(getattr(self, "processing_config_path", _default_processing_config_path())).expanduser()
+        candidates = _processing_config_candidates()
+        if current not in candidates:
+            candidates.insert(0, current)
+
+        self.processing_profile_combo.blockSignals(True)
+        try:
+            self.processing_profile_combo.clear()
+            selected_index = 0
+            for i, path in enumerate(candidates):
+                label = self._profile_label(path)
+                if not path.exists():
+                    label += "  [missing]"
+                self.processing_profile_combo.addItem(label, str(path))
+                if str(path) == str(current):
+                    selected_index = i
+            self.processing_profile_combo.setCurrentIndex(selected_index)
+        finally:
+            self.processing_profile_combo.blockSignals(False)
+
+    @QtCore.Slot()
+    def refresh_processing_profiles(self) -> None:
+        data = self.processing_profile_combo.currentData()
+        if data:
+            self.processing_config_path = Path(str(data)).expanduser()
+        self._populate_processing_profile_combo()
+        self.status_label.setText("Refreshed processing YAML profiles.")
+
+    @QtCore.Slot(int)
+    def _processing_profile_changed(self, index: int) -> None:
+        if index < 0:
+            return
+        self.load_selected_processing_yaml()
+
     def _apply_processing_config_to_widgets(self, cfg: Dict[str, Any]) -> None:
         """Overwrite visible Processing tab settings from a processing.yaml dict."""
         conv = cfg.get("conversion", {}) if isinstance(cfg.get("conversion"), dict) else {}
@@ -1366,21 +1467,34 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_root_edit.setText(str(upload.get("root", "/zfstank3/storage/camera_sessions_uploads")))
 
     @QtCore.Slot()
-    def load_processing_yaml(self) -> None:
-        path = _default_processing_config_path()
-        cfg = _load_processing_config().get("processing", {})
+    def load_selected_processing_yaml(self) -> None:
+        data = self.processing_profile_combo.currentData()
+        path = Path(str(data)).expanduser() if data else self.processing_config_path
+
+        cfg = _load_processing_config(path).get("processing", {})
         if not isinstance(cfg, dict):
             self.status_label.setText(f"processing config did not contain a processing: map: {path}")
             return
+
+        self.processing_config_path = path
+        self.settings.setValue("processing/config_path", str(path))
         self._apply_processing_config_to_widgets(cfg)
         self.refresh_sessions()
-        msg = f"Processing: loaded settings from {path}"
+
+        msg = f"Processing: loaded profile {self._profile_label(path)}"
         self.status_label.setText(msg)
         self.log_line.emit(msg)
 
+    # Compatibility with the first quick reload-button patch.
+    @QtCore.Slot()
+    def load_processing_yaml(self) -> None:
+        self.load_selected_processing_yaml()
+
+
     def _set_busy(self, busy: bool) -> None:
         for widget in [
-            self.load_config_btn, self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
+            self.processing_profile_combo, self.reload_profiles_btn, self.load_config_btn,
+            self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
             self.audit_btn, self.info_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
             self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn,
