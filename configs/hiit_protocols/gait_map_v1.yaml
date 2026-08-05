@@ -1,0 +1,233 @@
+# ============================================================
+# RatLab Treadmill — Kinematic Assessment Protocol
+# ------------------------------------------------------------
+# Author       : Andrew England <andrewengland19@gmail.com>
+# Created      : 2026-08-05
+# Last updated : 2026-08-05 00:00
+# ============================================================
+#
+# PROTOCOL: GaitMap v1 — Gait Transition & Steady-State Assessment
+#
+# PURPOSE
+#   Quantify steady-state locomotor kinematics at five pre-defined speed bins
+#   (16, 32, 40, 48, 54 cm/s) and provide sufficient speed resolution through
+#   the walk-to-trot transition zone (16–32 cm/s) to pinpoint transition speed
+#   at the individual-animal level via post-hoc DLC kinematic analysis.
+#
+# EXPERIMENTAL CONTEXT
+#   Subjects   : Tph2-iCre rats; intact and T10 contusion SCI cohorts
+#   Rig        : Single-lane kinematics rig, LED spotlights, no shock grid
+#   Cameras    : 4 cameras, 100 fps, continuous recording (no start/stop per step)
+#   Motivator  : Belt + trained compliance only; no grid; treat available at start
+#   State req  : Subjects must be fully acclimated to the test rig and capable of
+#                sustaining ≥32 cm/s for ≥15 s before this protocol is run.
+#                Do NOT run on naive or undertrained animals.
+#
+# DESIGN RATIONALE
+#   Walk-to-trot transition in Sprague-Dawley background rats: ~20–30 cm/s.
+#   At 16 cm/s subjects are walking; at 32 cm/s they are trotting. The 16→32
+#   transition ramp is the critical data-collection window. All other ramps are
+#   secondary — they capture potential trot-gallop transition (~50–60 cm/s) and
+#   provide kinematic continuity between bins.
+#
+#   RAMP RATES AND STRIDE YIELD (100 fps, ≥3–5 strides/cm/s criterion):
+#   ─────────────────────────────────────────────────────────────────────
+#   Ramp             Rate        Time/cm/s   Strides/cm/s
+#   0   → 16  cm/s  2.0 cm/s/s  0.5 s       ~1.4  (warmup only, not analyzed)
+#   16  → 32  cm/s  0.5 cm/s/s  2.0 s       ~5–9  ✓ (transition zone, fully analyzed)
+#   32  → 40  cm/s  1.0 cm/s/s  1.0 s       ~5    ✓
+#   40  → 48  cm/s  1.0 cm/s/s  1.0 s       ~6    ✓
+#   48  → 54  cm/s  1.0 cm/s/s  1.0 s       ~7    ✓
+#   54  →  0  cm/s  5.0 cm/s/s  n/a         n/a   (cooldown; animals removed)
+#
+#   Stride frequency estimates (Sprague-Dawley background, intact):
+#     16 cm/s → ~2.5 Hz (period ~400 ms)
+#     24 cm/s → ~3.5 Hz (period ~285 ms)
+#     32 cm/s → ~4.5 Hz (period ~220 ms)
+#     40 cm/s → ~5.5 Hz (period ~180 ms)
+#     54 cm/s → ~7.0 Hz (period ~143 ms)
+#
+# WALL-CLOCK TIME BUDGET
+#   ─────────────────────────────────────────────────────────────────────
+#   Step             Ramp (s)   Hold (s)   Block (s)
+#   SS_16            8          40         48
+#   RAMP_16-32 +     32         40         72
+#     SS_32
+#   SS_40            8          40         48
+#   SS_48            8          40         48
+#   SS_54            6          40         46
+#   COOLDOWN         ~11        10         21
+#   ─────────────────────────────────────────────────────────────────────
+#   TOTAL                                  283 s  ≈  4 min 43 s  ✓
+#
+# VIDEO / FRAME ALIGNMENT
+#   Cameras record continuously for the full session. Phase labels below
+#   (SS_16, RAMP_16-32, SS_32, etc.) correspond to the RatLab frame-alignment
+#   tags used during post-hoc DLC epoch segmentation. Ensure the belt-start TTL
+#   pulse or software timestamp is captured in the first frame of recording.
+#
+#   Frame count per phase (100 fps):
+#     Warmup ramp (0→16):     800 frames
+#     Ramp 16→32 (32 s):    3,200 frames  ← transition analysis window
+#     SS_16 (40 s):          4,000 frames
+#     SS_32 (40 s):          4,000 frames
+#     SS_40 (40 s):          4,000 frames
+#     SS_48 (40 s):          4,000 frames
+#     SS_54 (40 s):          4,000 frames
+#
+# OPERATOR CHECKLIST (pre-session)
+#   [ ] Verify camera trigger / sync active and recording confirmed on all 4 channels
+#   [ ] Confirm belt at 0 cm/s before importing this YAML
+#   [ ] Animal placed on stationary belt; lane gate closed; allow 5 s settle
+#   [ ] Single treat placed at front of lane before starting protocol
+#   [ ] Log: animal ID, cohort, DREADDs condition, CNO/SalB status, session date
+#
+# ABORT CRITERIA (operator-scored; runner does NOT enforce these)
+#   Abort and mark session INVALID if:
+#     - Animal stops for >15 s during any SS bin (belt compliance failure)
+#     - Animal falls or is ejected from belt at any speed
+#     - Camera dropout detected on any channel during transition ramp phase
+#   Partial abort: if the animal stops during SS_48 or SS_54, data from
+#   completed earlier bins is still valid — mark the session PARTIAL and note
+#   the last clean bin.
+#
+# POST-PROCESSING NOTES
+#   The RAMP_16-32 phase is the primary gait transition analysis window.
+#   For each animal, extract:
+#     1. Stride-by-stride step frequency, duty factor, and diagonal support
+#        as a function of instantaneous belt speed.
+#     2. Fit a sigmoidal or threshold model to duty factor vs. speed to
+#        estimate individual walk-to-trot transition speed (T_wt).
+#     3. Compare T_wt between intact vs. SCI animals and across DREADD conditions.
+#   The SS bins serve as anchor points for kinematics averaging (CoM trajectory,
+#   joint angle profiles, inter-limb coordination indices).
+
+protocol_name: gait_map_v1
+date: 2026-08-05
+description: >
+  GaitMap v1 — stepped speed assessment capturing steady-state kinematics at
+  5 bins (16, 32, 40, 48, 54 cm/s) and gait transition detection via slow
+  continuous ramp (0.5 cm/s/s) through the 16–32 cm/s walk-to-trot transition
+  zone. Total wall-clock time ~4 min 43 s. Single-lane kinematics rig, 4
+  cameras at 100 fps, no shock grid.
+
+target: 1
+step: 1
+every: 1
+
+defaults:
+  ramp_rate: 1.0   # cm/s/s — default for above-transition ramps
+
+steps:
+
+  # ─── STEADY STATE: 16 cm/s — walk baseline ───────────────────────────────
+  #
+  # RAMP (entry): 0 → 16 cm/s at 2.0 cm/s/s → 8 s ramp
+  #   Fast enough that the animal doesn't stall at low speed for too long,
+  #   slow enough to avoid a startling jerk. 8 s is a smooth acceleration.
+  #   The warmup ramp is NOT used for gait analysis — the stride count at
+  #   speeds below 16 cm/s during this ramp is insufficient for transition
+  #   analysis. Frame alignment should tag the start of the HOLD, not the ramp.
+  #
+  # HOLD: 40 s at 16 cm/s → ~100 strides
+  #   Establishes clean walking kinematics for the individual animal.
+  #   Use these frames as the primary "walk" reference epoch.
+  #
+  - type: run
+    speed: 16
+    duration: 40
+    ramp_rate: 2.0
+    label: SS_16 | walk baseline
+
+  # ─── SLOW RAMP + STEADY STATE: 16 → 32 cm/s — transition zone ───────────
+  #
+  # RAMP (entry): 16 → 32 cm/s at 0.5 cm/s/s → 32 s ramp
+  #   This is the primary data window for walk-to-trot transition detection.
+  #   At 0.5 cm/s/s, 2 seconds elapse per cm/s of speed increment.
+  #   Expected stride yield per cm/s:
+  #     At 18 cm/s: ~2.5 Hz × 2 s = ~5 strides/cm/s   ✓
+  #     At 24 cm/s: ~3.5 Hz × 2 s = ~7 strides/cm/s   ✓
+  #     At 30 cm/s: ~4.5 Hz × 2 s = ~9 strides/cm/s   ✓
+  #   All well above the ≥3–5 stride/cm/s design criterion.
+  #   Post-hoc analysis should treat every frame as a distinct speed sample
+  #   (interpolate belt speed from step timestamps at 100 fps resolution).
+  #
+  # HOLD: 40 s at 32 cm/s → ~180 strides
+  #   Establishes clean trotting kinematics. This epoch is the primary
+  #   "trot" reference for within-animal kinematic comparisons.
+  #
+  - type: run
+    speed: 32
+    duration: 40
+    ramp_rate: 0.5
+    label: SS_32 | transition ramp + trot baseline
+
+  # ─── STEADY STATE: 40 cm/s — mid trot ────────────────────────────────────
+  #
+  # RAMP (entry): 32 → 40 cm/s at 1.0 cm/s/s → 8 s ramp
+  #   1.0 cm/s/s gives ~1 s per cm/s. At 36 cm/s: ~5 Hz → ~5 strides/cm/s ✓
+  #   Well into trot regime — this ramp may capture early trot-gallop cues
+  #   if the animal's T_tg is unusually low, but is not the primary transition
+  #   analysis window.
+  #
+  # HOLD: 25 s at 40 cm/s → ~220 strides
+  #
+  - type: run
+    speed: 40
+    duration: 25
+    ramp_rate: 1.0
+    label: SS_40 | mid trot
+
+  # ─── STEADY STATE: 48 cm/s — fast trot ───────────────────────────────────
+  #
+  # RAMP (entry): 40 → 48 cm/s at 1.0 cm/s/s → 8 s ramp
+  #   At 44 cm/s: ~6 Hz → ~6 strides/cm/s ✓
+  #   Expected regime: fast trot. Trot-to-gallop transition in intact rats
+  #   typically occurs at 55–65 cm/s, so this speed is still trot for most
+  #   animals. SCI animals may show earlier transition — note any asymmetric
+  #   footfall patterns or extended aerial phase at this bin.
+  #
+  # HOLD: 40 s at 48 cm/s → ~260 strides
+  #
+  - type: run
+    speed: 48
+    duration: 15
+    ramp_rate: 1.0
+    label: SS_48 | fast trot
+
+  # ─── STEADY STATE: 54 cm/s — trot/gallop boundary ────────────────────────
+  #
+  # RAMP (entry): 48 → 54 cm/s at 1.0 cm/s/s → 6 s ramp
+  #   At 51 cm/s: ~7 Hz → ~7 strides/cm/s ✓
+  #   54 cm/s sits at or just below the expected trot-gallop boundary for
+  #   intact animals. A subset of animals may spontaneously gallop at this
+  #   speed. Log any observed gait breaks (asymmetric bounding, aerial phase,
+  #   lateral sequence disruption) as a flag for the SCI analysis.
+  #   SCI animals at this speed: expect increased variability, reduced stride
+  #   length, compensatory forelimb loading — all analyzable from DLC output.
+  #
+  # HOLD: 40 s at 54 cm/s → ~280 strides
+  #
+  - type: run
+    speed: 54
+    duration: 10
+    ramp_rate: 1.0
+    label: SS_54 | trot-gallop boundary
+
+  # ─── COOLDOWN — remove animals; belt decelerates ─────────────────────────
+  #
+  # RAMP (entry): 54 → 0 cm/s at 5.0 cm/s/s → ~11 s ramp
+  #   Fast deceleration. Remove the animal DURING this ramp (not after the
+  #   belt has stopped) so the animal steps off a still-moving belt — this
+  #   mirrors the trained dismount procedure and avoids a confusing abrupt stop.
+  #   Ideal removal window: when belt reaches ~20 cm/s (~7 s into cooldown).
+  #   Do NOT analyze frames from this phase.
+  #
+  # HOLD: 10 s at 0 cm/s — belt runs empty to confirm full stop.
+  #   Confirm camera recording terminates AFTER this step, not before.
+  #
+  - type: run
+    speed: 0
+    duration: 10
+    ramp_rate: 5.0
+    label: COOLDOWN | remove animal at ~20 cm/s; belt to full stop
