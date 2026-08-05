@@ -1188,6 +1188,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_port_edit.setMaximumWidth(80)
         self.upload_root_edit = QtWidgets.QLineEdit(str(upload.get("root", "/zfstank3/storage/camera_sessions_uploads")))
 
+        self.load_config_btn = QtWidgets.QPushButton("Load processing.yaml")
         self.refresh_btn = QtWidgets.QPushButton("Refresh sessions")
         self.create_btn = QtWidgets.QPushButton("Create and copy thumbnails")
         self.process_btn = QtWidgets.QPushButton("Process raws")
@@ -1219,6 +1220,7 @@ class ProcessingPanel(QtWidgets.QWidget):
 
         self._build_layout()
 
+        self.load_config_btn.clicked.connect(self.load_processing_yaml)
         self.refresh_btn.clicked.connect(self.refresh_sessions)
         self.create_btn.clicked.connect(self.create_thumbnails)
         self.process_btn.clicked.connect(lambda: self.run_pipeline("process"))
@@ -1277,6 +1279,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         top.addRow("Storage upload", upload)
 
         buttons1 = QtWidgets.QHBoxLayout()
+        buttons1.addWidget(self.load_config_btn)
         buttons1.addWidget(self.refresh_btn)
         buttons1.addWidget(self.create_btn)
         buttons1.addWidget(self.process_btn)
@@ -1331,9 +1334,53 @@ class ProcessingPanel(QtWidgets.QWidget):
         names = [x.strip() for x in self.cameras_edit.text().replace(",", " ").split()]
         return [x for x in names if x]
 
+    def _apply_processing_config_to_widgets(self, cfg: Dict[str, Any]) -> None:
+        """Overwrite visible Processing tab settings from a processing.yaml dict."""
+        conv = cfg.get("conversion", {}) if isinstance(cfg.get("conversion"), dict) else {}
+        upload = cfg.get("upload", {}) if isinstance(cfg.get("upload"), dict) else {}
+
+        self.processed_subdir = str(cfg.get("processed_subdir", "processed"))
+        self.thumbnails_subdir = str(cfg.get("thumbnails_subdir", "thumbnails"))
+        self.manifest_name = str(cfg.get("manifest_name", "processing_manifest.tsv"))
+        self.audit_threshold_frames = float(conv.get("audit_threshold_frames", 1.5))
+
+        self.base_dir_edit.setText(str(cfg.get("local_sessions_root", Path.home() / "camera_sessions")))
+        self.remote_root_edit.setText(str(cfg.get("remote_sessions_root", "/home/spencelab/camera_sessions")))
+
+        cameras = cfg.get("cameras", ["cam1", "cam2", "cam3", "cam4", "cam5"])
+        if isinstance(cameras, str):
+            camera_text = cameras
+        else:
+            camera_text = " ".join(str(x) for x in cameras)
+        self.cameras_edit.setText(camera_text)
+
+        self.fps_spin.setValue(float(conv.get("fps", 5.0)))
+        self.r_spin.setValue(float(conv.get("r_gain", 1.23)))
+        self.g_spin.setValue(float(conv.get("g_gain", 1.0)))
+        self.b_spin.setValue(float(conv.get("b_gain", 1.60)))
+        self.gamma_spin.setValue(float(conv.get("gamma", 1.0)))
+
+        self.upload_host_edit.setText(str(upload.get("host", "gpu2")))
+        self.upload_user_edit.setText(str(upload.get("user", "spencelab")))
+        self.upload_port_edit.setText(str(upload.get("port", "")))
+        self.upload_root_edit.setText(str(upload.get("root", "/zfstank3/storage/camera_sessions_uploads")))
+
+    @QtCore.Slot()
+    def load_processing_yaml(self) -> None:
+        path = _default_processing_config_path()
+        cfg = _load_processing_config().get("processing", {})
+        if not isinstance(cfg, dict):
+            self.status_label.setText(f"processing config did not contain a processing: map: {path}")
+            return
+        self._apply_processing_config_to_widgets(cfg)
+        self.refresh_sessions()
+        msg = f"Processing: loaded settings from {path}"
+        self.status_label.setText(msg)
+        self.log_line.emit(msg)
+
     def _set_busy(self, busy: bool) -> None:
         for widget in [
-            self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
+            self.load_config_btn, self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
             self.audit_btn, self.info_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
             self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn,
