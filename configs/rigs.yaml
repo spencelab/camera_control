@@ -198,3 +198,23 @@ rigs:
         command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
       - name: shutdown_cam1
         command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+
+  - key: ros2test_local_1color_hwtrig_ram250_raw
+    label: ros2test_local_1color_hwtrig_ram250_raw
+    description: "ros2test: local color cam1 in RAM circular buffer mode, 2048x700x250hz hardware-triggered, 1000-frame post-trigger dumps."
+    has_triggerbox: true
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1]
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig1 --ros-args -p default_fps:=250.0"
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8bayerGBRG_ram_buffer_hwtrigger.yaml"
+    shutdown_commands:
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"

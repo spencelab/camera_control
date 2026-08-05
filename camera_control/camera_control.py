@@ -10,6 +10,7 @@ What it does now:
   - Applies camera settings via cambuffer_recorder_ng/srv/ApplySettings
   - Tracks clean/dirty settings against camera read-back with amber/green/red fields
   - Starts/stops recording via std_srvs/srv/Trigger
+  - Requests RAM circular-buffer dumps via cambuffer_recorder_ng/srv/DumpBuffer
   - Adds a session/trial metadata panel
   - Creates a session folder + session.yaml before recording/apply-with-record
   - Passes node-specific output.dir, output.prefix, and metadata_path to CBRNG
@@ -30,6 +31,7 @@ import re
 import sys
 import getpass
 import shlex
+import time
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +43,7 @@ import rclpy
 from rclpy.node import Node
 from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
-from cambuffer_recorder_ng.srv import ApplySettings, GetStatus
+from cambuffer_recorder_ng.srv import ApplySettings, GetStatus, DumpBuffer
 
 try:
     from treadmill_control.msg import TreadmillStatus
@@ -377,6 +379,7 @@ class CameraControlRos(Node):
         self._status_clients: Dict[str, Any] = {}
         self._start_clients: Dict[str, Any] = {}
         self._stop_clients: Dict[str, Any] = {}
+        self._dump_clients: Dict[str, Any] = {}
         self._event_subs: Dict[str, Any] = {}
         self._treadmill_clients: Dict[str, Any] = {}
         self._treadmill_status_sub = None
@@ -474,6 +477,31 @@ class CameraControlRos(Node):
         suffix = "start_recording" if start else "stop_recording"
         cli = self._client(cache, Trigger, full_name, suffix)
         return cli.call_async(Trigger.Request())
+
+    def dump_buffer_async(
+        self,
+        full_name: str,
+        *,
+        label: str = "",
+        trigger_position: str = "post_trigger",
+        window_s: float = 4.0,
+        window_frames: int = 1000,
+        allow_partial: bool = False,
+        trigger_utc_ns: int = 0,
+        output_prefix: str = "",
+    ):
+        cli = self._client(self._dump_clients, DumpBuffer, full_name, "dump_buffer")
+        req = DumpBuffer.Request()
+        req.label = str(label or "")
+        req.trigger_position = str(trigger_position or "post_trigger")
+        req.window_s = float(window_s)
+        req.window_frames = int(window_frames)
+        req.pre_s = 0.0
+        req.post_s = 0.0
+        req.allow_partial = bool(allow_partial)
+        req.trigger_utc_ns = int(trigger_utc_ns)
+        req.output_prefix = str(output_prefix or "")
+        return cli.call_async(req)
 
     # ---- treadmill_control client helpers ----
     def treadmill_available(self) -> bool:
@@ -1234,6 +1262,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.mode.addItem("Keep current", None)
         self.mode.addItem("raw8mono_rolling", "raw8mono_rolling")
         self.mode.addItem("raw8bayerGBRG_rolling", "raw8bayerGBRG_rolling")
+        self.mode.addItem("raw8mono_ram_buffer", "raw8mono_ram_buffer")
+        self.mode.addItem("raw8bayerGBRG_ram_buffer", "raw8bayerGBRG_ram_buffer")
         self.mode.addItem("video_rgb24", "video_rgb24")
 
         self.pixel_format = QtWidgets.QComboBox()
@@ -1250,6 +1280,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.output_kind = QtWidgets.QComboBox()
         self.output_kind.addItem("Auto from mode", "auto")
         self.output_kind.addItem("rolling_raw_binary", "rolling_raw_binary")
+        self.output_kind.addItem("ram_raw_circular", "ram_raw_circular")
         self.output_kind.addItem("video_mp4", "video_mp4")
 
         self.read_btn = QtWidgets.QPushButton("Read from selected")
@@ -1261,6 +1292,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.apply_start_btn = QtWidgets.QPushButton("Apply + start recording")
         self.start_btn = QtWidgets.QPushButton("Start recording")
         self.stop_btn = QtWidgets.QPushButton("Stop recording")
+        self.dump_btn = QtWidgets.QPushButton("Dump RAM buffer (D)")
         self.preview_btn = QtWidgets.QPushButton("Open preview?")
 
         settings = QtWidgets.QFormLayout()
@@ -1292,7 +1324,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         buttons.addWidget(self.apply_start_btn, 0, 1)
         buttons.addWidget(self.start_btn, 1, 0)
         buttons.addWidget(self.stop_btn, 1, 1)
-        buttons.addWidget(self.preview_btn, 2, 0, 1, 2)
+        buttons.addWidget(self.dump_btn, 2, 0, 1, 2)
+        buttons.addWidget(self.preview_btn, 3, 0, 1, 2)
 
         top_buttons = QtWidgets.QHBoxLayout()
         top_buttons.addWidget(self.discover_btn)
@@ -1331,6 +1364,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.apply_start_btn.clicked.connect(lambda: self.apply_settings(True))
         self.start_btn.clicked.connect(self.start_recording)
         self.stop_btn.clicked.connect(self.stop_recording)
+        self.dump_btn.clicked.connect(self.dump_ram_buffer)
         self.preview_btn.clicked.connect(self.preview_stub)
 
         for widget in self.tracked_setting_widgets().values():
@@ -1401,7 +1435,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         value = self.output_kind.currentData()
         if value == "auto":
             mode = self.mode.currentData()
-            return "rolling_raw_binary" if mode in ("raw8mono_rolling", "raw8bayerGBRG_rolling") else None
+            return "ram_raw_circular" if mode in ("raw8mono_ram_buffer", "raw8bayerGBRG_ram_buffer") else ("rolling_raw_binary" if mode in ("raw8mono_rolling", "raw8bayerGBRG_rolling") else None)
         return value
 
     def current_setting_values(self) -> Dict[str, Any]:
@@ -1643,7 +1677,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         output_kind = self.output_kind.currentData()
 
         if output_kind == "auto":
-            output_kind = "rolling_raw_binary" if mode in ("raw8mono_rolling", "raw8bayerGBRG_rolling") else None
+            output_kind = "ram_raw_circular" if mode in ("raw8mono_ram_buffer", "raw8bayerGBRG_ram_buffer") else ("rolling_raw_binary" if mode in ("raw8mono_rolling", "raw8bayerGBRG_rolling") else None)
 
         settings: Dict[str, Any] = {
             "camera.width": self.width.value(),
@@ -1766,6 +1800,58 @@ class CameraPanel(QtWidgets.QGroupBox):
         for full in nodes:
             fut = self.ros.trigger_async(full, start=False)
             fut.add_done_callback(lambda f, full=full: self._trigger_done(full, "stop", f))
+
+    def _dump_label(self) -> str:
+        md = self.metadata_panel.current_metadata()
+        parts = [safe_token(md.animal_id, "animal"), safe_token(md.timepoint, "timepoint"), safe_token(md.trial_id, "trial")]
+        return "_".join(parts + [datetime.now().strftime("%H%M%S")])
+
+    def dump_ram_buffer(self):
+        nodes = self.selected_or_warn()
+        if not nodes:
+            return
+
+        # The camera node uses its active output.dir/output.prefix when output_prefix is empty.
+        # Start recording/apply-with-record should already have put those paths in the current session.
+        label = self._dump_label()
+        trigger_utc_ns = time.time_ns()
+        trigger_position = "post_trigger"
+        window_s = 4.0
+        window_frames = 1000
+        allow_partial = False
+
+        self.log(
+            f"RAM dump request for {len(nodes)} camera(s): "
+            f"trigger_position={trigger_position}, window_frames={window_frames}, "
+            f"window_s={window_s}, allow_partial={allow_partial}, trigger_utc_ns={trigger_utc_ns}, label={label}"
+        )
+        for full in nodes:
+            fut = self.ros.dump_buffer_async(
+                full,
+                label=label,
+                trigger_position=trigger_position,
+                window_s=window_s,
+                window_frames=window_frames,
+                allow_partial=allow_partial,
+                trigger_utc_ns=trigger_utc_ns,
+            )
+            fut.add_done_callback(lambda f, full=full: self._dump_done(full, f))
+
+    def _dump_done(self, full: str, fut):
+        try:
+            resp = fut.result()
+        except Exception as e:
+            self.log(f"RAM dump failed for {full}: {e}")
+            return
+
+        ok = bool(resp.success)
+        detail = (
+            f"{resp.message}; frames={resp.frames_written}; "
+            f"trigger={resp.trigger_position}; before={resp.frames_before_trigger}; after={resp.frames_after_trigger}; "
+            f"first={resp.first_file}; metadata={resp.metadata_path}"
+        )
+        self.log(f"{full} RAM dump: {'OK' if ok else 'FAIL'} - {detail}")
+        self.refresh_status()
 
     def _trigger_done(self, full: str, label: str, fut):
         try:
@@ -2324,6 +2410,30 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def keyPressEvent(self, event):
         text = event.text()
+        modifiers = event.modifiers()
+        focus = QtWidgets.QApplication.focusWidget()
+        editing = isinstance(
+            focus,
+            (
+                QtWidgets.QLineEdit,
+                QtWidgets.QPlainTextEdit,
+                QtWidgets.QTextEdit,
+                QtWidgets.QSpinBox,
+                QtWidgets.QDoubleSpinBox,
+                QtWidgets.QComboBox,
+            ),
+        )
+
+        if (
+            event.key() == QtCore.Qt.Key_D
+            and not event.isAutoRepeat()
+            and not editing
+            and not (modifiers & (QtCore.Qt.ControlModifier | QtCore.Qt.AltModifier | QtCore.Qt.MetaModifier))
+        ):
+            self.camera_panel.dump_ram_buffer()
+            event.accept()
+            return
+
         if hasattr(self, "treadmill_panel") and self.treadmill_panel.handle_key(event.key(), text):
             event.accept()
             return
