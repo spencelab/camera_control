@@ -33,7 +33,7 @@ import getpass
 import shlex
 import time
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Callable
 
@@ -44,6 +44,7 @@ from rclpy.node import Node
 from std_srvs.srv import Trigger
 from std_msgs.msg import String, Float64
 from cambuffer_recorder_ng.srv import ApplySettings, GetStatus, DumpBuffer
+from telemetry_recorder import SessionTelemetryRecorder, TelemetryPlan
 
 try:
     from treadmill_control.msg import TreadmillStatus
@@ -373,6 +374,9 @@ class SessionMetadata:
     def to_yaml(self) -> str:
         data = asdict(self)
         data["created_local_time"] = datetime.now().isoformat(timespec="seconds")
+        now_ns = time.time_ns()
+        data["created_utc"] = datetime.fromtimestamp(now_ns / 1e9, tz=timezone.utc).isoformat()
+        data["created_utc_ns"] = now_ns
         data["session_dir"] = str(self.session_dir())
         lines = ["session_metadata:"]
         for key, value in data.items():
@@ -812,6 +816,9 @@ class RigPreset:
     processes: Tuple[RigProcessSpec, ...]
     camera_nodes: Tuple[str, ...]
     has_triggerbox: bool = False
+    telemetry_treadmill: str = "off"
+    telemetry_triggerbox: str = "off"
+    telemetry_camera_events: bool = True
     configure_delay_ms: int = 4000
     discover_delay_ms: int = 6000
     shutdown_commands: Tuple[RigCommandSpec, ...] = ()
@@ -948,6 +955,18 @@ def _rig_from_dict(item: Dict[str, Any]) -> RigPreset:
 
     camera_nodes = tuple(str(x).strip().lstrip("/") for x in (item.get("camera_nodes") or []) if str(x).strip())
     has_triggerbox = bool(item.get("has_triggerbox", any(p.name == "triggerbox_host" for p in processes)))
+    telemetry = item.get("telemetry") or {}
+    if not isinstance(telemetry, dict):
+        raise ValueError(f"rig {key}: telemetry must be a mapping")
+    inferred_treadmill = "optional" if any(p.name == "treadmill_host" for p in processes) else "off"
+    inferred_triggerbox = "optional" if has_triggerbox else "off"
+    telemetry_treadmill = SessionTelemetryRecorder.normalize_policy(
+        telemetry.get("treadmill", inferred_treadmill), inferred_treadmill
+    )
+    telemetry_triggerbox = SessionTelemetryRecorder.normalize_policy(
+        telemetry.get("triggerbox", inferred_triggerbox), inferred_triggerbox
+    )
+    telemetry_camera_events = bool(telemetry.get("camera_events", True))
     configure_delay_ms = int(item.get("configure_delay_ms", 4000))
     discover_delay_ms = int(item.get("discover_delay_ms", 6000))
 
@@ -969,6 +988,9 @@ def _rig_from_dict(item: Dict[str, Any]) -> RigPreset:
         processes=tuple(processes),
         camera_nodes=camera_nodes,
         has_triggerbox=has_triggerbox,
+        telemetry_treadmill=telemetry_treadmill,
+        telemetry_triggerbox=telemetry_triggerbox,
+        telemetry_camera_events=telemetry_camera_events,
         configure_delay_ms=configure_delay_ms,
         discover_delay_ms=discover_delay_ms,
         shutdown_commands=tuple(shutdown_commands),
@@ -1280,6 +1302,13 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._populating_settings = False
         self._apply_batch_counter = 0
         self._pending_apply_batches: Dict[int, Dict[str, Any]] = {}
+        self._stop_batch_counter = 0
+        self._pending_stop_batches: Dict[int, Dict[str, Any]] = {}
+
+        self.telemetry = SessionTelemetryRecorder(self)
+        self.telemetry.log_line.connect(self.log)
+        self.telemetry.state_changed.connect(self._telemetry_state_changed)
+        self.telemetry.stopped.connect(self._telemetry_stopped)
 
         self.discover_btn = QtWidgets.QPushButton("Discover cameras")
         self.refresh_btn = QtWidgets.QPushButton("Refresh status")
@@ -1333,6 +1362,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.stop_btn = QtWidgets.QPushButton("Stop recording")
         self.dump_btn = QtWidgets.QPushButton("Dump RAM buffer (D)")
         self.preview_btn = QtWidgets.QPushButton("Open preview?")
+        self.telemetry_label = QtWidgets.QLabel("Telemetry: idle")
+        self.telemetry_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
 
         settings = QtWidgets.QFormLayout()
         settings.addRow("Mode", self.mode)
@@ -1381,6 +1412,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         right.addWidget(settings_box)
         right.addLayout(sync_row)
         right.addLayout(buttons)
+        right.addWidget(self.telemetry_label)
         right.addStretch(1)
 
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -1640,7 +1672,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.update_setting_styles()
         self.log("reverted local camera setting edits")
 
-    def _begin_apply_batch(self, nodes: List[str]) -> int:
+    def _begin_apply_batch(self, nodes: List[str], recording_start: bool = False) -> int:
         self._apply_batch_counter += 1
         batch_id = self._apply_batch_counter
         self._pending_apply_batches[batch_id] = {
@@ -1648,8 +1680,25 @@ class CameraPanel(QtWidgets.QGroupBox):
             "remaining": len(nodes),
             "success": {},
             "messages": {},
+            "recording_start": bool(recording_start),
         }
+        if recording_start:
+            QtCore.QTimer.singleShot(12000, lambda batch_id=batch_id: self._apply_batch_timeout(batch_id))
         return batch_id
+
+    def _apply_batch_timeout(self, batch_id: int) -> None:
+        batch = self._pending_apply_batches.get(batch_id)
+        if batch is None or batch.get("remaining", 0) <= 0:
+            return
+        successes = batch.get("success", {})
+        n_ok = sum(1 for value in successes.values() if value)
+        pending = int(batch.get("remaining", 0))
+        self.log(
+            f"camera recording start timed out: {n_ok} confirmed, {pending} response(s) pending"
+        )
+        if n_ok == 0 and self.telemetry.is_active():
+            self.telemetry.stop_async("camera recording start timed out with no confirmed cameras")
+        self._pending_apply_batches.pop(batch_id, None)
 
     def _record_apply_result(self, batch_id: int, full: str, ok: bool, message: str):
         batch = self._pending_apply_batches.get(batch_id)
@@ -1680,6 +1729,9 @@ class CameraPanel(QtWidgets.QGroupBox):
                 "Apply settings incomplete",
                 f"Applied settings to {n_ok}/{n_total} camera(s).\n\nFailed:\n" + "\n".join(failed),
             )
+        if batch.get("recording_start") and n_ok == 0 and self.telemetry.is_active():
+            self.log("all camera recording starts failed; closing telemetry bag")
+            self.telemetry.stop_async("all camera recording starts failed")
         self._pending_apply_batches.pop(batch_id, None)
 
     def selected_or_warn(self) -> List[str]:
@@ -1878,6 +1930,110 @@ class CameraPanel(QtWidgets.QGroupBox):
             return None
         return self._recording_metadata_guard(md)
 
+    def _active_rig(self) -> RigPreset:
+        win = self.window()
+        panel = getattr(win, "system_panel", None)
+        if panel is not None and getattr(panel, "active_rig", None) is not None:
+            return panel.active_rig
+        return RIG_PRESETS[0]
+
+    def _resolve_telemetry_plan(self, nodes: List[str]) -> Optional[TelemetryPlan]:
+        rig = self._active_rig()
+        while True:
+            plan = SessionTelemetryRecorder.resolve_plan(
+                self.ros,
+                camera_nodes=nodes or list(rig.camera_nodes),
+                treadmill_policy=rig.telemetry_treadmill,
+                triggerbox_policy=rig.telemetry_triggerbox,
+                camera_events=rig.telemetry_camera_events,
+            )
+
+            if plan.missing_optional_devices:
+                self.log(
+                    "telemetry optional device(s) absent: "
+                    + ", ".join(plan.missing_optional_devices)
+                )
+            for mismatch in plan.type_mismatches:
+                self.log(f"telemetry topic type mismatch: {mismatch}")
+
+            if not plan.missing_required_devices:
+                return plan
+
+            dialog = QtWidgets.QMessageBox(self)
+            dialog.setWindowTitle("Required telemetry missing")
+            dialog.setIcon(QtWidgets.QMessageBox.Warning)
+            dialog.setText(
+                "Required telemetry device(s) are not visible on the ROS graph:\n\n"
+                + "\n".join(plan.missing_required_devices)
+            )
+            dialog.setInformativeText(
+                "Retry after starting the device, continue with an explicitly incomplete "
+                "telemetry bag, or cancel recording."
+            )
+            retry = dialog.addButton("Retry", QtWidgets.QMessageBox.AcceptRole)
+            proceed = dialog.addButton("Record without missing device", QtWidgets.QMessageBox.DestructiveRole)
+            cancel = dialog.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+            dialog.setDefaultButton(retry)
+            dialog.exec()
+            clicked = dialog.clickedButton()
+            if clicked is retry:
+                continue
+            if clicked is proceed:
+                self.log(
+                    "recording with missing required telemetry: "
+                    + ", ".join(plan.missing_required_devices)
+                )
+                return plan
+            if clicked is cancel:
+                return None
+            return None
+
+    def _start_telemetry_for_recording(self, md: SessionMetadata, nodes: List[str]) -> bool:
+        if self.telemetry.is_active():
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Telemetry already active",
+                "Stop the current recording/telemetry bag before starting another session.",
+            )
+            return False
+
+        plan = self._resolve_telemetry_plan(nodes)
+        if plan is None:
+            return False
+
+        ok, message = self.telemetry.start(md.session_dir(), plan)
+        self.log(f"telemetry: {'OK' if ok else 'FAIL'} - {message}")
+        if ok:
+            return True
+
+        dialog = QtWidgets.QMessageBox(self)
+        dialog.setWindowTitle("Telemetry recorder failed")
+        dialog.setIcon(QtWidgets.QMessageBox.Critical)
+        dialog.setText(message)
+        dialog.setInformativeText(
+            "Camera recording can continue without telemetry, but treadmill and triggerbox "
+            "history will not be safely archived."
+        )
+        proceed = dialog.addButton("Record cameras without telemetry", QtWidgets.QMessageBox.DestructiveRole)
+        cancel = dialog.addButton("Cancel", QtWidgets.QMessageBox.RejectRole)
+        dialog.exec()
+        return dialog.clickedButton() is proceed
+
+    def _telemetry_state_changed(self, state: str) -> None:
+        bag = self.telemetry.bag_dir
+        suffix = f" | {bag.name}" if bag is not None else ""
+        self.telemetry_label.setText(f"Telemetry: {state}{suffix}")
+
+    def _telemetry_stopped(self, ok: bool, message: str) -> None:
+        self.log(f"telemetry stop: {'OK' if ok else 'FAIL'} - {message}")
+        bag = self.telemetry.bag_dir
+        if bag is not None:
+            plotter = Path(__file__).resolve().parents[1] / "tools" / "plot_treadmill_bag.py"
+            self.log(
+                "treadmill sanity plot command: "
+                f"python3 {shlex.quote(str(plotter))} {shlex.quote(str(bag))}"
+            )
+
 
 
     def apply_settings(self, activate_after_apply: bool):
@@ -1889,13 +2045,15 @@ class CameraPanel(QtWidgets.QGroupBox):
             md = self.prepare_recording_metadata("Apply + start recording needs trial metadata.")
             if md is None:
                 return
+            if not self._start_telemetry_for_recording(md, nodes):
+                return
         else:
             # Applying settings can be metadata-free, but if confirmed metadata exists, use it for output paths.
             md = self.metadata_panel.current_metadata() if self.metadata_panel.confirmed else None
 
         self._commit_setting_editors()
         self.update_setting_styles()
-        batch_id = self._begin_apply_batch(nodes)
+        batch_id = self._begin_apply_batch(nodes, recording_start=activate_after_apply)
         for full in nodes:
             settings_yaml = self.build_settings_for_node(full, md)
             vals = self.current_setting_values()
@@ -1935,9 +2093,11 @@ class CameraPanel(QtWidgets.QGroupBox):
         md = self.prepare_recording_metadata("Start recording needs trial metadata.")
         if md is None:
             return
+        if not self._start_telemetry_for_recording(md, nodes):
+            return
         # Important: start_recording alone does not reconfigure CBRNG paths.
         # We apply metadata/output settings first, then start.
-        batch_id = self._begin_apply_batch(nodes)
+        batch_id = self._begin_apply_batch(nodes, recording_start=True)
         for full in nodes:
             settings_yaml = self.build_settings_for_node(full, md)
             fut = self.ros.apply_settings_async(
@@ -1953,9 +2113,63 @@ class CameraPanel(QtWidgets.QGroupBox):
         nodes = self.selected_or_warn()
         if not nodes:
             return
+        self._stop_batch_counter += 1
+        batch_id = self._stop_batch_counter
+        self._pending_stop_batches[batch_id] = {
+            "remaining": len(nodes),
+            "results": {},
+            "finished": False,
+        }
         for full in nodes:
             fut = self.ros.trigger_async(full, start=False)
-            fut.add_done_callback(lambda f, full=full: self._trigger_done(full, "stop", f))
+            fut.add_done_callback(
+                lambda f, full=full, batch_id=batch_id: self._stop_recording_done(batch_id, full, f)
+            )
+        QtCore.QTimer.singleShot(6000, lambda batch_id=batch_id: self._stop_batch_timeout(batch_id))
+
+    def _stop_recording_done(self, batch_id: int, full: str, fut) -> None:
+        batch = self._pending_stop_batches.get(batch_id)
+        if batch is None or batch.get("finished"):
+            return
+        try:
+            resp = fut.result()
+            ok = bool(resp.success)
+            message = str(resp.message)
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        batch["results"][full] = ok
+        batch["remaining"] -= 1
+        self.log(f"{full} stop: {'OK' if ok else 'FAIL'} - {message}")
+        self.refresh_status()
+        if batch["remaining"] <= 0:
+            self._finish_stop_batch(batch_id, timed_out=False)
+
+    def _stop_batch_timeout(self, batch_id: int) -> None:
+        batch = self._pending_stop_batches.get(batch_id)
+        if batch is None or batch.get("finished"):
+            return
+        self.log(
+            f"camera stop batch timed out with {batch['remaining']} response(s) pending; "
+            "closing telemetry bag anyway"
+        )
+        self._finish_stop_batch(batch_id, timed_out=True)
+
+    def _finish_stop_batch(self, batch_id: int, timed_out: bool) -> None:
+        batch = self._pending_stop_batches.get(batch_id)
+        if batch is None or batch.get("finished"):
+            return
+        batch["finished"] = True
+        results = batch.get("results", {})
+        ok_count = sum(1 for value in results.values() if value)
+        total_count = len(results) + int(batch.get("remaining", 0))
+        reason = (
+            f"camera stop complete ({ok_count}/{total_count} confirmed)"
+            + (" after timeout" if timed_out else "")
+        )
+        if self.telemetry.is_active():
+            QtCore.QTimer.singleShot(350, lambda reason=reason: self.telemetry.stop_async(reason))
+        self._pending_stop_batches.pop(batch_id, None)
 
     def _dump_label(self) -> str:
         # Keep dump filenames compact. CBRNG already includes:
@@ -2450,6 +2664,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self._process_close_timeout = QtCore.QTimer(self)
         self._process_close_timeout.setSingleShot(True)
         self._process_close_timeout.timeout.connect(self._force_process_shutdown_for_close)
+        self._telemetry_close_waiting = False
+        self._telemetry_close_timeout = QtCore.QTimer(self)
+        self._telemetry_close_timeout.setSingleShot(True)
+        self._telemetry_close_timeout.timeout.connect(self._telemetry_close_timed_out)
         self.setWindowTitle("camera_control: cameras + metadata")
         # Let Qt choose a natural initial size; avoid unnecessary scrollbars.
 
@@ -2485,6 +2703,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.camera_panel = CameraPanel(ros, self.metadata_panel, bottom_left_widget=log_group)
         self.ros.set_event_callback(self.append_log)
+        self.camera_panel.telemetry.stopped.connect(self._telemetry_stopped_for_close)
 
         self.process_manager = RosProcessManager(self)
         self.process_manager.log_line.connect(self.append_log)
@@ -2675,6 +2894,28 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._close_cleanup_complete:
             return
         self._close_cleanup_timeout.stop()
+        telemetry = getattr(getattr(self, "camera_panel", None), "telemetry", None)
+        if telemetry is not None and telemetry.is_active():
+            self.append_log("GUI exit: finalizing active telemetry bag...")
+            self._telemetry_close_waiting = True
+            self._telemetry_close_timeout.start(15000)
+            telemetry.stop_async("GUI exit")
+            return
+        self._begin_process_shutdown_for_close()
+
+    def _telemetry_stopped_for_close(self, ok: bool, message: str) -> None:
+        if not self._telemetry_close_waiting:
+            return
+        self._telemetry_close_waiting = False
+        self._telemetry_close_timeout.stop()
+        self.append_log(f"GUI exit: telemetry {'OK' if ok else 'FAIL'} - {message}")
+        self._begin_process_shutdown_for_close()
+
+    def _telemetry_close_timed_out(self) -> None:
+        if not self._telemetry_close_waiting:
+            return
+        self._telemetry_close_waiting = False
+        self.append_log("GUI exit: telemetry finalization timed out; continuing system shutdown")
         self._begin_process_shutdown_for_close()
 
     def _begin_process_shutdown_for_close(self):

@@ -1276,6 +1276,20 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             self._append_manifest(session, "tmill", "upload_session", False, msg)
             return False
 
+        active_marker = local_dir / "rosbag" / "TELEMETRY_ACTIVE"
+        if active_marker.exists():
+            msg = f"REFUSING_UPLOAD_ACTIVE_TELEMETRY {active_marker}"
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
+            self._append_manifest(session, "tmill", "upload_session", False, msg)
+            return False
+
+        # Invalidate any older verification before attempting a fresh upload.
+        # A failed or interrupted upload must leave local deletion blocked.
+        try:
+            (local_dir / ".SESSION_UPLOAD_VERIFY_OK").unlink()
+        except FileNotFoundError:
+            pass
+
         storage = self._storage_spec()
         remote_dir = f"{self.upload_root}/{session}"
         upload_items: List[Path] = []
@@ -1307,12 +1321,108 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             return False
 
         ok = proc.returncode == 0
-        if ok:
-            self.log.emit(f"Processing: {session}/tmill: upload_session OK to {storage}:{remote_dir}")
-        else:
+        if not ok:
             self.log.emit(f"Processing: {session}/tmill: upload_session FAIL rc={proc.returncode}: {_tail(proc.stdout, 8)}")
-        self._append_manifest(session, "tmill", "upload_session", ok, _tail(proc.stdout, 8))
-        return ok
+            self._append_manifest(session, "tmill", "upload_session", False, _tail(proc.stdout, 8))
+            return False
+
+        # Verify every session-level file by relative path and byte size. This is
+        # intentionally stronger than merely checking remote session.yaml because
+        # the rosbag is scientifically important and local deletion must never
+        # outrun a partial rsync.
+        ignored_names = {".SESSION_UPLOAD_VERIFY_OK", ".session_upload_sizes.tsv"}
+        local_sizes: Dict[str, int] = {}
+        for item in upload_items:
+            if item.is_file():
+                if item.name not in ignored_names:
+                    local_sizes[str(item.relative_to(local_dir))] = item.stat().st_size
+                continue
+            for child in item.rglob("*"):
+                if child.is_file() and child.name not in ignored_names:
+                    local_sizes[str(child.relative_to(local_dir))] = child.stat().st_size
+
+        roots = " ".join(_q(item.name) for item in upload_items)
+        remote_list_cmd = (
+            f"cd {_q(remote_dir)} && "
+            f"find {roots} -type f ! -name '.SESSION_UPLOAD_VERIFY_OK' "
+            f"! -name '.session_upload_sizes.tsv' -printf '%p\\t%s\\n' | sort"
+        )
+        remote_list = self._run_local(
+            ["ssh"] + self._storage_ssh_argv() + [storage, remote_list_cmd],
+            timeout_s=120,
+        )
+        if remote_list.returncode != 0:
+            msg = f"SESSION_LEVEL_VERIFY_LIST_FAILED {_tail(remote_list.stdout, 8)}"
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
+            self._append_manifest(session, "tmill", "upload_session", False, msg)
+            return False
+
+        remote_sizes: Dict[str, int] = {}
+        try:
+            for line in (remote_list.stdout or "").splitlines():
+                rel, size = line.rsplit("\t", 1)
+                remote_sizes[rel.lstrip("./")] = int(size)
+        except Exception as exc:
+            msg = f"SESSION_LEVEL_VERIFY_PARSE_FAILED {exc}"
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
+            self._append_manifest(session, "tmill", "upload_session", False, msg)
+            return False
+
+        missing = sorted(set(local_sizes) - set(remote_sizes))[:10]
+        mismatched = sorted(
+            key for key in set(local_sizes) & set(remote_sizes)
+            if local_sizes[key] != remote_sizes[key]
+        )[:10]
+        if missing or mismatched:
+            msg = (
+                f"SESSION_LEVEL_VERIFY_MISMATCH local={len(local_sizes)} remote={len(remote_sizes)} "
+                f"missing={missing} size_mismatch={mismatched}"
+            )
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
+            self._append_manifest(session, "tmill", "upload_session", False, msg)
+            return False
+
+        msg = f"SESSION_UPLOAD_VERIFY_OK files={len(local_sizes)} to {storage}:{remote_dir}"
+        self._append_manifest(session, "tmill", "upload_session", True, msg)
+
+        sentinel = local_dir / ".SESSION_UPLOAD_VERIFY_OK"
+        sentinel.write_text(
+            f"verified_utc={datetime.utcnow().isoformat(timespec='seconds')}Z\nfiles={len(local_sizes)}\n",
+            encoding="utf-8",
+        )
+        # _append_manifest above adds the final success line after the main rsync.
+        # Push that updated manifest plus the verification sentinel as the last
+        # atomic-ish bookkeeping step.
+        final_items = [sentinel]
+        manifest = local_dir / self.manifest_name
+        if manifest.is_file():
+            final_items.insert(0, manifest)
+        final_sync = self._run_local(
+            ["rsync", "-a", "--partial"]
+            + self._storage_rsync_argv()
+            + [str(path) for path in final_items]
+            + [f"{storage}:{remote_dir}/"],
+            timeout_s=300,
+        )
+        if final_sync.returncode != 0:
+            # A partial final rsync could have copied the sentinel before failing.
+            # Remove both copies best-effort so local deletion stays hard-blocked.
+            try:
+                sentinel.unlink()
+            except FileNotFoundError:
+                pass
+            remove_remote = f"rm -f {_q(remote_dir + '/.SESSION_UPLOAD_VERIFY_OK')}"
+            self._run_local(
+                ["ssh"] + self._storage_ssh_argv() + [storage, remove_remote],
+                timeout_s=60,
+            )
+            msg = f"SESSION_LEVEL_REMOTE_SENTINEL_FAILED {_tail(final_sync.stdout, 4)}"
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
+            self._append_manifest(session, "tmill", "upload_session", False, msg)
+            return False
+
+        self.log.emit(f"Processing: {session}/tmill: upload_session OK: {msg}")
+        return True
 
 
     def _delete_local_session_tree(self, session: str) -> bool:
@@ -1337,6 +1447,20 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             self._append_manifest(session, "tmill", "delete_session_local", False, msg)
             return False
 
+        active_marker = local_dir / "rosbag" / "TELEMETRY_ACTIVE"
+        if active_marker.exists():
+            msg = f"REFUSING_DELETE_ACTIVE_TELEMETRY {active_marker}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
+        local_session_verify = local_dir / ".SESSION_UPLOAD_VERIFY_OK"
+        if not local_session_verify.is_file():
+            msg = f"REFUSING_DELETE_SESSION_WITHOUT_VERIFY {local_session_verify}"
+            self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+            self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+            return False
+
         raw_examples = sorted(local_dir.rglob("*.cbrraw"))[:5]
         if raw_examples:
             msg = "REFUSING_DELETE_SESSION_WITH_RAW_FILES " + " ".join(str(p) for p in raw_examples)
@@ -1347,7 +1471,10 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
         # Require that the session-level copy exists on storage before deleting
         # the local folder. Camera processed files are guarded by per-camera
         # UPLOAD_VERIFY_OK checks before their directories can be removed.
-        check_cmd = f"test -s {_q(remote_dir + '/session.yaml')}"
+        check_cmd = (
+            f"test -s {_q(remote_dir + '/session.yaml')} && "
+            f"test -f {_q(remote_dir + '/.SESSION_UPLOAD_VERIFY_OK')}"
+        )
         check = self._run_local(["ssh"] + self._storage_ssh_argv() + [storage, check_cmd], timeout_s=60)
         if check.returncode != 0:
             msg = f"REFUSING_DELETE_SESSION_STORAGE_MISSING {storage}:{remote_dir}/session.yaml {_tail(check.stdout, 4)}"
