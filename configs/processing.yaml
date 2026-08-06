@@ -2,6 +2,8 @@ processing:
   local_sessions_root: "/home/spencelab/camera_sessions"
   remote_sessions_root: "/home/spencelab/camera_sessions"
 
+  max_parallel_cameras: 5
+
   cameras:
     - cam1@local
 
@@ -19,4 +21,4 @@ processing:
     port: "44717"
     root: "/zfsr01/storage/camera_sessions_uploads"
     verify: "size"
-    max_parallel_uploads: 1
+    max_parallel_uploads: 5

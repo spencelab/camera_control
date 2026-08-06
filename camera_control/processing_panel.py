@@ -15,12 +15,14 @@ main camera cockpit does not grow another tentacle.
 
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import signal
 import shlex
 import shutil
 import socket
 import subprocess
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -93,6 +95,7 @@ def _load_processing_config(path: Optional[Path] = None) -> Dict[str, Any]:
             "local_sessions_root": str(Path.home() / "camera_sessions"),
             "remote_sessions_root": "/home/spencelab/camera_sessions",
             "cameras": ["cam1", "cam2", "cam3", "cam4", "cam5"],
+            "max_parallel_cameras": 5,
             "processed_subdir": "processed",
             "thumbnails_subdir": "thumbnails",
             "manifest_name": "processing_manifest.tsv",
@@ -110,7 +113,7 @@ def _load_processing_config(path: Optional[Path] = None) -> Dict[str, Any]:
                 "port": "",
                 "root": "/zfstank3/storage/camera_sessions_uploads",
                 "verify": "size",
-                "max_parallel_uploads": 1,
+                "max_parallel_uploads": 5,
             },
             "rosbag": {
                 "subdir": "rosbag",
@@ -565,6 +568,8 @@ class PipelineWorker(QtCore.QObject):
         upload_host: str,
         upload_port: str,
         upload_root: str,
+        max_parallel_cameras: int = 5,
+        max_parallel_uploads: int = 5,
         parent: Optional[QtCore.QObject] = None,
     ):
         super().__init__(parent)
@@ -587,21 +592,39 @@ class PipelineWorker(QtCore.QObject):
         self.upload_host = upload_host.strip() or "gpu2"
         self.upload_port = str(upload_port or "").strip()
         self.upload_root = upload_root.rstrip("/")
+        self.max_parallel_cameras = max(1, int(max_parallel_cameras or 1))
+        self.max_parallel_uploads = max(1, int(max_parallel_uploads or 1))
         self._cancelled = False
+        self._proc_lock = threading.Lock()
+        self._manifest_lock = threading.Lock()
+        self._active_procs: List[subprocess.Popen[str]] = []
         self._current_proc: Optional[subprocess.Popen[str]] = None
 
     @QtCore.Slot()
     def cancel(self) -> None:
         self._cancelled = True
-        proc = self._current_proc
-        if proc is not None and proc.poll() is None:
+        with self._proc_lock:
+            procs = list(self._active_procs)
+            if self._current_proc is not None and self._current_proc not in procs:
+                procs.append(self._current_proc)
+
+        if not procs:
+            self.log.emit("Processing: cancellation requested; no active process is currently registered")
+            return
+
+        for proc in procs:
+            if proc.poll() is not None:
+                continue
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
                 self.log.emit(f"Processing: sent SIGTERM to active process group pid={proc.pid}")
             except Exception as exc:
-                self.log.emit(f"Processing: could not terminate active process pid={proc.pid}: {exc}")
+                try:
+                    proc.terminate()
+                    self.log.emit(f"Processing: terminate fallback sent to pid={proc.pid}")
+                except Exception:
+                    self.log.emit(f"Processing: could not terminate active process pid={proc.pid}: {exc}")
 
-    @QtCore.Slot()
     def run(self) -> None:
         action_plan = self._expand_action(self.action)
         jobs = [PipelineJob(session=s, cam=spec.cam, host=spec.host) for s in self.sessions for spec in self.camera_specs]
@@ -613,37 +636,35 @@ class PipelineWorker(QtCore.QObject):
         done = 0
         ok = 0
 
-        self.log.emit(f"Processing: action '{self.action}' starting for {len(self.sessions)} sessions x {len(self.camera_specs)} cameras")
+        self.log.emit(
+            f"Processing: action '{self.action}' starting for {len(self.sessions)} sessions x "
+            f"{len(self.camera_specs)} cameras; parallel cameras={self.max_parallel_cameras}, "
+            f"parallel uploads={self.max_parallel_uploads}"
+        )
+
         for session in self.sessions:
             if self._cancelled:
                 break
+
+            session_jobs = [j for j in jobs if j.session == session]
+
             if "upload_session" in action_plan:
                 if self._upload_session_level_files(session):
                     ok += 1
                 done += 1
                 self.progress.emit(done, total)
 
-            for job in [j for j in jobs if j.session == session]:
-                for step in per_cam_steps:
-                    if self._cancelled:
-                        break
-                    if self._run_camera_step(job, step):
-                        ok += 1
-                    done += 1
-                    self.progress.emit(done, total)
+            for step in per_cam_steps:
                 if self._cancelled:
                     break
+                done, ok = self._run_camera_step_group(session, session_jobs, step, done, ok, total)
 
-            # Upload tmill session-level files again after camera steps so the
-            # storage copy gets the updated processing_manifest.tsv entries.
             if (not self._cancelled) and "upload_session" in action_plan:
                 if self._upload_session_level_files(session):
                     ok += 1
                 done += 1
                 self.progress.emit(done, total)
 
-            # Final cleanup: remove local/control-machine session copy after
-            # all selected camera-host cleanup steps have run.
             if (not self._cancelled) and "delete_session_local" in action_plan:
                 if self._delete_local_session_tree(session):
                     ok += 1
@@ -654,6 +675,70 @@ class PipelineWorker(QtCore.QObject):
             self.log.emit(f"Processing: action '{self.action}' cancelled")
         self.log.emit(f"Processing: action '{self.action}' complete: {ok}/{done} step(s) OK")
         self.finished.emit(self.action, ok, done)
+
+    def _parallel_limit_for_step(self, step: str) -> int:
+        if step in ("upload", "verify_upload"):
+            return self.max_parallel_uploads
+        return self.max_parallel_cameras
+
+    def _run_camera_step_group(
+        self,
+        session: str,
+        jobs: List[PipelineJob],
+        step: str,
+        done: int,
+        ok: int,
+        total: int,
+    ) -> tuple[int, int]:
+        if not jobs:
+            return done, ok
+
+        max_workers = max(1, min(len(jobs), self._parallel_limit_for_step(step)))
+        self.status.emit(f"{session}: {step}: launching {len(jobs)} camera job(s), parallel={max_workers}")
+        self.log.emit(f"Processing: {session}: {step} launching {len(jobs)} camera job(s), parallel={max_workers}")
+
+        if max_workers == 1:
+            for job in jobs:
+                if self._cancelled:
+                    break
+                if self._run_camera_step(job, step):
+                    ok += 1
+                done += 1
+                self.progress.emit(done, total)
+            return done, ok
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix=f"processing_{step}",
+        )
+        futures: Dict[concurrent.futures.Future[bool], PipelineJob] = {}
+        try:
+            for job in jobs:
+                if self._cancelled:
+                    break
+                futures[executor.submit(self._run_camera_step, job, step)] = job
+
+            for future in concurrent.futures.as_completed(futures):
+                job = futures[future]
+                try:
+                    step_ok = bool(future.result())
+                except Exception as exc:
+                    step_ok = False
+                    msg = f"EXCEPTION during {step}: {exc}"
+                    self.log.emit(f"Processing: {job.session}/{job.cam}: {step} FAIL: {msg}")
+                    self._append_manifest(job.session, job.cam, step, False, msg)
+
+                if step_ok:
+                    ok += 1
+                done += 1
+                self.progress.emit(done, total)
+
+                if self._cancelled:
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        return done, ok
 
     def _expand_action(self, action: str) -> List[str]:
         if action == "process":
@@ -718,7 +803,9 @@ class PipelineWorker(QtCore.QObject):
                 bufsize=1,
                 start_new_session=True,
             )
-            self._current_proc = proc
+            with self._proc_lock:
+                self._active_procs.append(proc)
+                self._current_proc = proc
             assert proc.stdout is not None
             for raw_line in proc.stdout:
                 line = raw_line.rstrip()
@@ -735,8 +822,14 @@ class PipelineWorker(QtCore.QObject):
             rc = proc.wait()
             return subprocess.CompletedProcess(argv, rc, "\n".join(lines))
         finally:
-            if proc is not None and self._current_proc is proc:
-                self._current_proc = None
+            if proc is not None:
+                with self._proc_lock:
+                    try:
+                        self._active_procs.remove(proc)
+                    except ValueError:
+                        pass
+                    if self._current_proc is proc:
+                        self._current_proc = self._active_procs[-1] if self._active_procs else None
 
     def _storage_spec(self) -> str:
         return f"{self.upload_user}@{self.upload_host}"
@@ -1239,14 +1332,14 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
 
     def _append_manifest(self, session: str, cam: str, step: str, ok: bool, detail: str) -> None:
         path = self.base_dir / session / self.manifest_name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists():
-            path.write_text("timestamp_utc\tsession\tcamera\tstep\tok\tdetail\n", encoding="utf-8")
         clean_detail = " ".join(str(detail).split())[:800]
-        with path.open("a", encoding="utf-8") as f:
-            f.write(
-                f"{datetime.utcnow().isoformat(timespec='seconds')}Z\t{session}\t{cam}\t{step}\t{int(ok)}\t{clean_detail}\n"
-            )
+        line = f"{datetime.utcnow().isoformat(timespec='seconds')}Z\t{session}\t{cam}\t{step}\t{int(ok)}\t{clean_detail}\n"
+        with self._manifest_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                path.write_text("timestamp_utc\tsession\tcamera\tstep\tok\tdetail\n", encoding="utf-8")
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line)
 
     def _run_camera_step(self, job: PipelineJob, step: str) -> bool:
         self.log.emit(f"Processing: {job.session}/{job.cam}: {step} on {job.host}")
@@ -1550,6 +1643,8 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.thumbnails_subdir = str(cfg.get("thumbnails_subdir", "thumbnails"))
         self.manifest_name = str(cfg.get("manifest_name", "processing_manifest.tsv"))
         self.audit_threshold_frames = float(conv.get("audit_threshold_frames", 1.5))
+        self.max_parallel_cameras = max(1, int(cfg.get("max_parallel_cameras", 5)))
+        self.max_parallel_uploads = max(1, int(upload.get("max_parallel_uploads", 5)))
 
         self.base_dir_edit = QtWidgets.QLineEdit(str(cfg.get("local_sessions_root", Path.home() / "camera_sessions")))
         self.remote_root_edit = QtWidgets.QLineEdit(str(cfg.get("remote_sessions_root", "/home/spencelab/camera_sessions")))
@@ -1786,6 +1881,8 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.thumbnails_subdir = str(cfg.get("thumbnails_subdir", "thumbnails"))
         self.manifest_name = str(cfg.get("manifest_name", "processing_manifest.tsv"))
         self.audit_threshold_frames = float(conv.get("audit_threshold_frames", 1.5))
+        self.max_parallel_cameras = max(1, int(cfg.get("max_parallel_cameras", 5)))
+        self.max_parallel_uploads = max(1, int(upload.get("max_parallel_uploads", 5)))
 
         self.base_dir_edit.setText(str(cfg.get("local_sessions_root", Path.home() / "camera_sessions")))
         self.remote_root_edit.setText(str(cfg.get("remote_sessions_root", "/home/spencelab/camera_sessions")))
@@ -1949,6 +2046,8 @@ class ProcessingPanel(QtWidgets.QWidget):
             upload_host=self.upload_host_edit.text().strip(),
             upload_port=self.upload_port_edit.text().strip(),
             upload_root=self.upload_root_edit.text().strip(),
+            max_parallel_cameras=self.max_parallel_cameras,
+            max_parallel_uploads=self.max_parallel_uploads,
         )
         self._start_worker(self._worker, self._worker.run, self._worker.finished, self._on_pipeline_finished)
 
