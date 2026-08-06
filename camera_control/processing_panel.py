@@ -246,7 +246,11 @@ class ThumbnailWorker(QtCore.QObject):
         self.r_gain = r_gain
         self.g_gain = g_gain
         self.b_gain = b_gain
-        self.gamma = gamma
+
+        # Thumbnails use the processing/profile RGB white-balance gains, but
+        # intentionally leave gamma neutral for now. Full MP4 processing still
+        # uses the GUI/profile gamma value through PipelineWorker.
+        self.gamma = 1.0
         self._cancelled = False
 
     @QtCore.Slot()
@@ -294,12 +298,134 @@ class ThumbnailWorker(QtCore.QObject):
 
     def _remote_script(self, session: str, cam: str) -> str:
         # The camera node records into that host's local camera_sessions tree.
+        # Keep annotation function outside the f-string so bash/Python braces do
+        # not become a brace confetti incident.
+        annotate_script = r"""
+annotate_thumbnail() {
+  local png="$1"
+  local raw="$2"
+  local meta="$3"
+  local r_gain="$4"
+  local g_gain="$5"
+  local b_gain="$6"
+
+  python3 - "$png" "$raw" "$meta" "$r_gain" "$g_gain" "$b_gain" <<'PYANNOTATE' || true
+import sys
+from pathlib import Path
+
+png_path = Path(sys.argv[1])
+raw_path = Path(sys.argv[2])
+meta_path = sys.argv[3]
+r_gain = sys.argv[4]
+g_gain = sys.argv[5]
+b_gain = sys.argv[6]
+
+try:
+    import cv2  # type: ignore
+    import numpy as np  # type: ignore
+except Exception as exc:
+    print(f"THUMBNAIL_ANNOTATE_SKIPPED missing cv2/numpy: {exc}")
+    raise SystemExit(0)
+
+img = cv2.imread(str(png_path), cv2.IMREAD_UNCHANGED)
+if img is None:
+    print(f"THUMBNAIL_ANNOTATE_SKIPPED could not read {png_path}")
+    raise SystemExit(0)
+
+if img.ndim == 2:
+    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+elif img.shape[2] == 4:
+    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+h, w = img.shape[:2]
+banner_h = max(54, min(96, h // 9))
+overlay = img.copy()
+cv2.rectangle(overlay, (0, 0), (w, banner_h), (0, 0, 0), -1)
+img = cv2.addWeighted(overlay, 0.62, img, 0.38, 0)
+
+base = raw_path.name
+if base.endswith("_0000.cbrraw"):
+    base = base[:-len("_0000.cbrraw")]
+
+line1 = base
+line2 = f"WB R={r_gain} G={g_gain} B={b_gain}"
+if meta_path and meta_path != "none":
+    line2 += f"  meta={Path(meta_path).name}"
+
+font = cv2.FONT_HERSHEY_SIMPLEX
+scale1 = max(0.42, min(0.72, w / 2600.0))
+scale2 = max(0.38, min(0.62, w / 3000.0))
+thick = max(1, int(round(w / 1200.0)))
+
+def put_fit(text, y, scale, color=(255, 255, 255)):
+    max_width = max(80, w - 24)
+    rendered = text
+    while len(rendered) > 8:
+        (tw, _), _ = cv2.getTextSize(rendered, font, scale, thick)
+        if tw <= max_width:
+            break
+        rendered = rendered[:-9] + "..."
+    cv2.putText(img, rendered, (12, y), font, scale, color, thick, cv2.LINE_AA)
+
+put_fit(line1, int(banner_h * 0.43), scale1)
+put_fit(line2, int(banner_h * 0.82), scale2, (220, 255, 220))
+
+hist_w = max(180, min(320, w // 5))
+hist_h = max(44, min(banner_h - 14, 78))
+x0 = max(0, w - hist_w - 12)
+y0 = 7
+x1 = x0 + hist_w
+y1 = y0 + hist_h
+
+cv2.rectangle(img, (x0, y0), (x1, y1), (18, 18, 18), -1)
+cv2.rectangle(img, (x0, y0), (x1, y1), (230, 230, 230), 1)
+
+roi = img[banner_h:, :, :]
+if roi.size == 0:
+    roi = img
+
+b, g, r = cv2.split(roi[:, :, :3])
+is_mono = np.array_equal(b, g) and np.array_equal(g, r)
+
+def draw_hist(channel, color):
+    hist = cv2.calcHist([channel], [0], None, [256], [0, 256]).flatten()
+    if hist.max() > 0:
+        hist = hist / hist.max()
+    pts = []
+    for i in range(256):
+        x = int(x0 + 1 + (i / 255.0) * (hist_w - 2))
+        y = int(y1 - 2 - hist[i] * (hist_h - 5))
+        pts.append((x, y))
+    for a, bpt in zip(pts[:-1], pts[1:]):
+        cv2.line(img, a, bpt, color, 1, cv2.LINE_AA)
+
+if is_mono:
+    gray = cv2.cvtColor(roi[:, :, :3], cv2.COLOR_BGR2GRAY)
+    draw_hist(gray, (240, 240, 240))
+    label = "mono hist"
+else:
+    draw_hist(b, (255, 130, 90))
+    draw_hist(g, (120, 255, 120))
+    draw_hist(r, (100, 130, 255))
+    label = "RGB hist"
+
+cv2.line(img, (x1 - 2, y0 + 1), (x1 - 2, y1 - 1), (255, 255, 255), 1)
+cv2.putText(img, "255", (x1 - 34, y1 - 5), font, 0.35, (255, 255, 255), 1, cv2.LINE_AA)
+cv2.putText(img, label, (x0 + 5, y0 + 14), font, 0.38, (255, 255, 255), 1, cv2.LINE_AA)
+
+if cv2.imwrite(str(png_path), img):
+    print(f"THUMBNAIL_ANNOTATED {png_path}")
+else:
+    print(f"THUMBNAIL_ANNOTATE_SKIPPED could not write {png_path}")
+PYANNOTATE
+}
+"""
         r = shlex.quote(f"{self.r_gain:.6g}")
         g = shlex.quote(f"{self.g_gain:.6g}")
         b = shlex.quote(f"{self.b_gain:.6g}")
-        gamma = shlex.quote(f"{self.gamma:.6g}")
+        gamma = "1.0"  # thumbnails: RGB WB yes, gamma neutral for now
 
-        return f"""
+        return annotate_script + "\n" + f"""
 set -eo pipefail
 source /opt/ros/jazzy/setup.bash
 source ~/ros2_ws/install/setup.bash
@@ -313,18 +439,23 @@ if [[ ! -d "$DIR" ]]; then
 fi
 mapfile -t RAW_STARTS < <(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort)
 if [[ "${{#RAW_STARTS[@]}}" == "0" ]]; then
-  RAW=""
-else
-  RAW="${{RAW_STARTS[-1]}}"
-  echo "THUMBNAIL_USING $(basename "$RAW") of ${{#RAW_STARTS[@]}} raw starts"
-fi
-if [[ -z "${{RAW}}" ]]; then
   echo "NO_CBRRAW $DIR"
   exit 21
 fi
+RAW="${{RAW_STARTS[-1]}}"
+echo "THUMBNAIL_USING $(basename "$RAW") of ${{#RAW_STARTS[@]}} raw starts"
+
 META="${{RAW%_0000.cbrraw}}.metadata.yaml"
 if [[ ! -f "$META" ]]; then
-  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "{cam}_*.metadata.yaml" | sort | head -n 1)
+  BASE="$(basename "${{RAW%_0000.cbrraw}}")"
+  SESSION_BASE="$(printf '%s\n' "$BASE" | sed -E 's/_[0-9]{{8}}T[0-9]{{6}}Z.*$//')"
+  META_BY_BASE="$DIR/${{SESSION_BASE}}.metadata.yaml"
+  if [[ -f "$META_BY_BASE" ]]; then
+    META="$META_BY_BASE"
+  fi
+fi
+if [[ ! -f "$META" ]]; then
+  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" ! -name '*dump[0-9]*.metadata.yaml' | sort | head -n 1)
   if [[ -n "$META_BY_CAM" ]]; then
     META="$META_BY_CAM"
   fi
@@ -335,11 +466,19 @@ if [[ ! -f "$META" ]]; then
     META="$META_ANY"
   fi
 fi
+
 PNG="$DIR/{cam}_first.png"
 if [[ ! -f "$META" ]]; then
   META=none
 fi
-ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$PNG" 1 0 "$META" {r} {g} {b} {gamma}
+
+echo "THUMBNAIL_WB R={r} G={g} B={b} gamma=$gamma"
+ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$PNG" 1 0 "$META" {r} {g} {b} "$gamma"
+
+# Annotation is nice-to-have; never let it turn a good PNG into a failed job.
+annotate_thumbnail "$PNG" "$RAW" "$META" {r} {g} {b} || true
+
+# Keep the PNG path as the final line; _process_one copies this.
 echo "$PNG"
 """.strip()
 
