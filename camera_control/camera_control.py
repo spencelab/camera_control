@@ -309,6 +309,26 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def increment_trailing_number(text: str) -> str:
+    """Increment a trailing integer while preserving zero padding.
+
+    Examples:
+      1 -> 2
+      001 -> 002
+      rat004 -> rat005
+      rat -> rat_1
+      rat_1 -> rat_2
+    """
+    text = str(text or "").strip()
+    if not text:
+        return "1"
+    match = re.match(r"^(.*?)(\d+)$", text)
+    if not match:
+        return f"{text}_1"
+    stem, digits = match.groups()
+    return f"{stem}{int(digits) + 1:0{len(digits)}d}"
+
+
 @dataclass
 class SessionMetadata:
     base_dir: str = str(Path.home() / "camera_sessions")
@@ -334,9 +354,13 @@ class SessionMetadata:
         return missing
 
     def session_label(self) -> str:
+        # Folder convention:
+        #   YYYY-MM-DD_experimenter_experiment_animalid_timepoint_trial
         date = datetime.now().strftime("%Y-%m-%d")
         parts = [
             date,
+            safe_token(self.operator, "experimenter"),
+            safe_token(self.experiment_id, "experiment"),
             safe_token(self.animal_id, "animal"),
             safe_token(self.timepoint, "timepoint"),
             safe_token(self.trial_id, "trial"),
@@ -363,6 +387,8 @@ class SessionMetadata:
     def node_prefix(self, node_name: str) -> str:
         return "_".join([
             safe_token(node_name.strip("/"), "cam"),
+            safe_token(self.operator, "experimenter"),
+            safe_token(self.experiment_id, "experiment"),
             safe_token(self.animal_id, "animal"),
             safe_token(self.timepoint, "timepoint"),
             safe_token(self.trial_id, "trial"),
@@ -653,16 +679,32 @@ class MetadataPanel(QtWidgets.QGroupBox):
             post_trigger_s=self.post_trigger_s.text().strip(),
         )
 
+    def set_confirmed_metadata(self, md: SessionMetadata) -> None:
+        """Mark the current fields as confirmed and ensure session.yaml exists."""
+        path = md.write_session_yaml()
+        self.confirmed = True
+        self.status_label.setText(f"Confirmed ? {path.parent.name}")
+        self.metadata_changed.emit()
+
+    def increment_animal_id_field(self) -> SessionMetadata:
+        self.animal_id.setText(increment_trailing_number(self.animal_id.text()))
+        md = self.current_metadata()
+        self.set_confirmed_metadata(md)
+        return md
+
+    def increment_trial_id_field(self) -> SessionMetadata:
+        self.trial_id.setText(increment_trailing_number(self.trial_id.text()))
+        md = self.current_metadata()
+        self.set_confirmed_metadata(md)
+        return md
+
     def confirm(self) -> bool:
         md = self.current_metadata()
         missing = md.required_missing()
         if missing:
             QtWidgets.QMessageBox.warning(self, "Metadata incomplete", "Missing: " + ", ".join(missing))
             return False
-        path = md.write_session_yaml()
-        self.confirmed = True
-        self.status_label.setText(f"Confirmed ? {path.parent.name}")
-        self.metadata_changed.emit()
+        self.set_confirmed_metadata(md)
         return True
 
     def ensure_confirmed(self, parent: QtWidgets.QWidget, reason: str) -> Optional[SessionMetadata]:
@@ -683,10 +725,7 @@ class MetadataPanel(QtWidgets.QGroupBox):
             if clicked is cancel or clicked is edit:
                 return None
             if clicked is use:
-                md.write_session_yaml()
-                self.confirmed = True
-                self.status_label.setText(f"Confirmed ? {md.session_dir().name}")
-                self.metadata_changed.emit()
+                self.set_confirmed_metadata(md)
         return self.current_metadata()
 
 
@@ -1724,13 +1763,130 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         return flat_yaml(settings)
 
+    def _session_folder_has_prior_outputs(self, path: Path) -> bool:
+        """Return True if a session folder looks previously used for recording.
+
+        Confirming metadata creates session.yaml, so session.yaml alone should
+        not trigger the duplicate-recording guard. Camera directories,
+        thumbnails, processing manifests, raws, MP4s, and metadata files do.
+        """
+        if not path.exists():
+            return False
+        try:
+            for child in path.iterdir():
+                if child.name == "session.yaml":
+                    continue
+                if child.name.startswith("."):
+                    continue
+                return True
+        except OSError:
+            # If we cannot inspect it, be conservative.
+            return True
+        return False
+
+    def _goto_metadata_tab(self) -> None:
+        win = self.window()
+        if hasattr(win, "goto_metadata_tab"):
+            win.goto_metadata_tab()
+
+    def _show_recording_folder_guard_dialog(self, session_dir: Path) -> str:
+        """Show duplicate-session guard with deterministic button order."""
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Session folder already exists")
+        dialog.setModal(True)
+
+        label = QtWidgets.QLabel(
+            "This metadata points to an existing session folder that already "
+            "has camera/output content.\n\n"
+            f"{session_dir}\n\n"
+            "Choose how to proceed."
+        )
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+
+        chosen = {"action": "cancel"}
+
+        def choose(action: str) -> None:
+            chosen["action"] = action
+            dialog.accept()
+
+        buttons = QtWidgets.QHBoxLayout()
+        button_specs = [
+            ("inc_trial", "Increment TrialID and record"),
+            ("inc_animal", "Increment AnimalID and record"),
+            ("edit", "Edit Metadata"),
+            ("continue", "Continue and add to folder"),
+            ("cancel", "Cancel"),
+        ]
+
+        default_button = None
+        for action, text in button_specs:
+            btn = QtWidgets.QPushButton(text)
+            btn.clicked.connect(lambda checked=False, action=action: choose(action))
+            buttons.addWidget(btn)
+            if action == "inc_trial":
+                default_button = btn
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.addWidget(label)
+        layout.addLayout(buttons)
+        dialog.setLayout(layout)
+
+        if default_button is not None:
+            default_button.setDefault(True)
+            default_button.setFocus()
+
+        dialog.exec()
+        return chosen["action"]
+
+    def _recording_metadata_guard(self, md: SessionMetadata) -> Optional[SessionMetadata]:
+        """Prevent accidental second rolling recording into the same session folder."""
+        while self._session_folder_has_prior_outputs(md.session_dir()):
+            action = self._show_recording_folder_guard_dialog(md.session_dir())
+
+            if action == "inc_trial":
+                md = self.metadata_panel.increment_trial_id_field()
+                self.log(f"incremented Trial ID; new session folder: {md.session_dir().name}")
+                continue
+
+            if action == "inc_animal":
+                md = self.metadata_panel.increment_animal_id_field()
+                self.log(f"incremented Animal ID; new session folder: {md.session_dir().name}")
+                continue
+
+            if action == "edit":
+                self.metadata_panel.confirmed = False
+                self.metadata_panel.status_label.setText("Not confirmed")
+                self.metadata_panel.metadata_changed.emit()
+                self._goto_metadata_tab()
+                return None
+
+            if action == "continue":
+                self.log(f"continuing with existing session folder: {md.session_dir()}")
+                self.metadata_panel.set_confirmed_metadata(md)
+                return md
+
+            return None
+
+        self.metadata_panel.set_confirmed_metadata(md)
+        return md
+
+
+    def prepare_recording_metadata(self, reason: str) -> Optional[SessionMetadata]:
+        md = self.metadata_panel.ensure_confirmed(self, reason)
+        if md is None:
+            return None
+        return self._recording_metadata_guard(md)
+
+
+
     def apply_settings(self, activate_after_apply: bool):
         nodes = self.selected_or_warn()
         if not nodes:
             return
         md = None
         if activate_after_apply:
-            md = self.metadata_panel.ensure_confirmed(self, "Apply + start recording needs trial metadata.")
+            md = self.prepare_recording_metadata("Apply + start recording needs trial metadata.")
             if md is None:
                 return
         else:
@@ -1776,7 +1932,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         nodes = self.selected_or_warn()
         if not nodes:
             return
-        md = self.metadata_panel.ensure_confirmed(self, "Start recording needs trial metadata.")
+        md = self.prepare_recording_metadata("Start recording needs trial metadata.")
         if md is None:
             return
         # Important: start_recording alone does not reconfigure CBRNG paths.
@@ -1802,9 +1958,13 @@ class CameraPanel(QtWidgets.QGroupBox):
             fut.add_done_callback(lambda f, full=full: self._trigger_done(full, "stop", f))
 
     def _dump_label(self) -> str:
-        md = self.metadata_panel.current_metadata()
-        parts = [safe_token(md.animal_id, "animal"), safe_token(md.timepoint, "timepoint"), safe_token(md.trial_id, "trial")]
-        return "_".join(parts + [datetime.now().strftime("%H%M%S")])
+        # Keep dump filenames compact. CBRNG already includes:
+        #   output.prefix + run_id + dump000001
+        #
+        # Add only the local clock time so repeated dumps are human-readable:
+        #   ..._dump000001_060603_0000.cbrraw
+        return datetime.now().strftime("%H%M%S")
+
 
     def dump_ram_buffer(self):
         nodes = self.selected_or_warn()
@@ -2556,6 +2716,23 @@ class MainWindow(QtWidgets.QMainWindow):
     def goto_metadata_tab(self):
         self.tabs.setCurrentIndex(1)
 
+    def _status_bar_text(self, text: str, max_chars: int = 220) -> str:
+        """Keep the bottom status bar from expanding the whole window.
+
+        The event log keeps the full line. The status bar gets a compact
+        middle-elided preview so long processing paths do not force the GUI
+        wider than the screen.
+        """
+        text = " ".join(str(text).split())
+        if len(text) <= max_chars:
+            return text
+
+        # Preserve the beginning and the file/result tail. The middle is usually
+        # giant paths or ffmpeg chatter.
+        head_chars = 90
+        tail_chars = max(40, max_chars - head_chars - 5)
+        return f"{text[:head_chars]} ... {text[-tail_chars:]}"
+
     def append_log(self, msg: str):
         if hasattr(self, "pause_log_chk") and self.pause_log_chk.isChecked():
             return
@@ -2567,7 +2744,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.autoscroll_chk.isChecked():
             bar = self.log_box.verticalScrollBar()
             bar.setValue(bar.maximum())
-        self.statusBar().showMessage(compact, 5000)
+        self.statusBar().showMessage(self._status_bar_text(compact), 5000)
 
 
 def main():

@@ -311,7 +311,13 @@ if [[ ! -d "$DIR" ]]; then
   echo "NO_SESSION_DIR $DIR"
   exit 20
 fi
-RAW=$(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort | head -n 1)
+mapfile -t RAW_STARTS < <(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort)
+if [[ "${{#RAW_STARTS[@]}}" == "0" ]]; then
+  RAW=""
+else
+  RAW="${{RAW_STARTS[-1]}}"
+  echo "THUMBNAIL_USING $(basename "$RAW") of ${{#RAW_STARTS[@]}} raw starts"
+fi
 if [[ -z "${{RAW}}" ]]; then
   echo "NO_CBRRAW $DIR"
   exit 21
@@ -616,7 +622,17 @@ if [[ -n "$STORAGE_PORT" ]]; then
 fi
 """.strip()
 
-    def _remote_base_snippet(self, job: PipelineJob) -> str:
+    def _remote_common_snippet(self, job: PipelineJob) -> str:
+        """Shared shell setup for camera steps that operate on raw start files.
+
+        A single camera/session folder may contain multiple independent raw starts:
+          - rolling:  BASE_0000.cbrraw, BASE_0001.cbrraw, ...
+          - RAM dump: BASE_dump000001_HHMMSS_0000.cbrraw
+
+        We enumerate every *_0000.cbrraw and treat each prefix as one unit.
+        raw_rolling_to_mp4/raw_rolling_audit will follow numbered rolling chunks
+        from that start prefix automatically.
+        """
         return f"""
 set -eo pipefail
 source /opt/ros/jazzy/setup.bash
@@ -629,94 +645,117 @@ DIR="$ROOT/$SESSION/$CAM"
 if [[ ! -d "$DIR" ]]; then
   echo "NO_SESSION_DIR $DIR"
   exit 20
-fi
-RAW=$(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort | head -n 1)
-if [[ -z "$RAW" ]]; then
-  echo "NO_CBRRAW $DIR"
-  exit 21
-fi
-PREFIX="${{RAW%_0000.cbrraw}}"
-BASE="$(basename "$PREFIX")"
-META="${{PREFIX}}.metadata.yaml"
-if [[ ! -f "$META" ]]; then
-  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" | sort | head -n 1)
-  if [[ -n "$META_BY_CAM" ]]; then
-    META="$META_BY_CAM"
-  fi
-fi
-if [[ ! -f "$META" ]]; then
-  META_ANY=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
-  if [[ -n "$META_ANY" ]]; then
-    META="$META_ANY"
-  fi
 fi
 PROC_DIR="$DIR/$PROCESSED_SUBDIR"
 mkdir -p "$PROC_DIR"
-MP4="$PROC_DIR/${{BASE}}.mp4"
-AUDIT="$PROC_DIR/${{BASE}}.audit.csv"
-AUDIT_STDOUT="$PROC_DIR/${{BASE}}.audit.stdout.txt"
-INFO="$PROC_DIR/${{BASE}}.raw_info.txt"
-CONVERT_STDOUT="$PROC_DIR/${{BASE}}.convert.stdout.txt"
-CONVERT_ENV="$PROC_DIR/${{BASE}}.convert.env"
-VERIFY="$PROC_DIR/${{BASE}}.verify.env"
-if [[ ! -f "$META" ]]; then
-  META=none
-else
-  echo "METADATA_USING $META"
+
+metadata_for_prefix() {{
+  local prefix="$1"
+  local base
+  base="$(basename "$prefix")"
+  local meta="${{prefix}}.metadata.yaml"
+
+  # RAM dumps usually have exact per-dump metadata.
+  if [[ -f "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+
+  # Rolling runs usually have one camera/session metadata file without the
+  # per-start timestamp suffix. Strip _YYYYMMDDTHHMMSSZ... to find it.
+  local session_base
+  session_base="$(printf '%s\n' "$base" | sed -E 's/_[0-9]{{8}}T[0-9]{{6}}Z.*$//')"
+  meta="$DIR/${{session_base}}.metadata.yaml"
+  if [[ -f "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+
+  # Prefer non-dump camera/session metadata before dump-specific metadata.
+  meta=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" ! -name '*dump[0-9]*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+
+  meta=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+
+  echo none
+}}
+
+set_current_raw() {{
+  RAW="$1"
+  PREFIX="${{RAW%_0000.cbrraw}}"
+  BASE="$(basename "$PREFIX")"
+  META="$(metadata_for_prefix "$PREFIX")"
+  MP4="$PROC_DIR/${{BASE}}.mp4"
+  AUDIT="$PROC_DIR/${{BASE}}.audit.csv"
+  AUDIT_STDOUT="$PROC_DIR/${{BASE}}.audit.stdout.txt"
+  INFO="$PROC_DIR/${{BASE}}.raw_info.txt"
+  CONVERT_STDOUT="$PROC_DIR/${{BASE}}.convert.stdout.txt"
+  CONVERT_ENV="$PROC_DIR/${{BASE}}.convert.env"
+  VERIFY="$PROC_DIR/${{BASE}}.verify.env"
+  if [[ "$META" != "none" ]]; then
+    echo "METADATA_USING $META"
+  fi
+}}
+
+mapfile -t RAW_STARTS < <(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort)
+if [[ "${{#RAW_STARTS[@]}}" == "0" ]]; then
+  echo "NO_CBRRAW $DIR"
+  exit 21
 fi
+echo "RAW_START_COUNT $CAM ${{#RAW_STARTS[@]}}"
 """.strip()
 
-    def _processed_base_snippet(self, job: PipelineJob) -> str:
-        """Snippet for steps that operate on processed outputs after raws may be deleted."""
-        return f"""
-set -eo pipefail
-source /opt/ros/jazzy/setup.bash
-source ~/ros2_ws/install/setup.bash
-SESSION={_q(job.session)}
-CAM={_q(job.cam)}
-ROOT={_q(self.remote_sessions_root)}
-PROCESSED_SUBDIR={_q(self.processed_subdir)}
-DIR="$ROOT/$SESSION/$CAM"
-if [[ ! -d "$DIR" ]]; then
-  echo "NO_SESSION_DIR $DIR"
-  exit 20
-fi
-PROC_DIR="$DIR/$PROCESSED_SUBDIR"
+    def _processed_dir_snippet(self, job: PipelineJob, *, require_processed: bool = True) -> str:
+        """Shared shell setup for steps that operate on processed/ as a whole."""
+        require_line = """
 if [[ ! -d "$PROC_DIR" ]]; then
   echo "NO_PROCESSED_DIR $PROC_DIR"
   exit 22
 fi
-BASE=""
-VERIFY_OK=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.VERIFY_OK' | sort | head -n 1)
-if [[ -n "$VERIFY_OK" ]]; then
-  BASE="$(basename "${{VERIFY_OK%.VERIFY_OK}}")"
+""" if require_processed else ""
+        return f"""
+set -eo pipefail
+source /opt/ros/jazzy/setup.bash
+source ~/ros2_ws/install/setup.bash
+SESSION={_q(job.session)}
+CAM={_q(job.cam)}
+ROOT={_q(self.remote_sessions_root)}
+PROCESSED_SUBDIR={_q(self.processed_subdir)}
+DIR="$ROOT/$SESSION/$CAM"
+if [[ ! -d "$DIR" ]]; then
+  echo "NO_SESSION_DIR $DIR"
+  exit 20
 fi
-if [[ -z "$BASE" ]]; then
-  PROCESS_ENV=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.process.env' | sort | head -n 1)
-  if [[ -n "$PROCESS_ENV" ]]; then
-    BASE="$(basename "${{PROCESS_ENV%.process.env}}")"
-  fi
-fi
-if [[ -z "$BASE" ]]; then
-  MP4_FIRST=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.mp4' | sort | head -n 1)
-  if [[ -n "$MP4_FIRST" ]]; then
-    BASE="$(basename "${{MP4_FIRST%.mp4}}")"
-  fi
-fi
-if [[ -z "$BASE" ]]; then
+PROC_DIR="$DIR/$PROCESSED_SUBDIR"
+{require_line}
+""".strip()
+
+    # Backward-compatible name for older call sites/patches.
+    def _processed_base_snippet(self, job: PipelineJob) -> str:
+        return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + """
+mapfile -t PROCESSED_BASES < <(find "$PROC_DIR" -maxdepth 1 -type f -name '*.mp4' -printf '%f\n' | sed 's/\\.mp4$//' | sort)
+if [[ "${#PROCESSED_BASES[@]}" == "0" ]]; then
   echo "NO_PROCESSED_BASE $PROC_DIR"
   exit 23
 fi
+BASE="${PROCESSED_BASES[0]}"
 RAW=""
 PREFIX="$DIR/$BASE"
-META="$PROC_DIR/${{BASE}}.metadata.yaml"
-MP4="$PROC_DIR/${{BASE}}.mp4"
-AUDIT="$PROC_DIR/${{BASE}}.audit.csv"
-AUDIT_STDOUT="$PROC_DIR/${{BASE}}.audit.stdout.txt"
-INFO="$PROC_DIR/${{BASE}}.raw_info.txt"
-CONVERT_STDOUT="$PROC_DIR/${{BASE}}.convert.stdout.txt"
-CONVERT_ENV="$PROC_DIR/${{BASE}}.convert.env"
-VERIFY="$PROC_DIR/${{BASE}}.verify.env"
+META="$PROC_DIR/${BASE}.metadata.yaml"
+MP4="$PROC_DIR/${BASE}.mp4"
+AUDIT="$PROC_DIR/${BASE}.audit.csv"
+AUDIT_STDOUT="$PROC_DIR/${BASE}.audit.stdout.txt"
+INFO="$PROC_DIR/${BASE}.raw_info.txt"
+CONVERT_STDOUT="$PROC_DIR/${BASE}.convert.stdout.txt"
+CONVERT_ENV="$PROC_DIR/${BASE}.convert.env"
+VERIFY="$PROC_DIR/${BASE}.verify.env"
 echo "PROCESSED_BASE_USING $BASE"
 """.strip()
 
@@ -779,24 +818,30 @@ echo "LOCAL_CAMERA_SESSION_DELETED $CAM bytes=$BYTES files=$FILES dir=$DIR"
 """.strip()
 
     def _script_info(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + """
-
-ros2 run cambuffer_recorder_ng raw_rolling_info "$RAW" > "$INFO" 2>&1
-echo "RAW_INFO_WRITTEN $INFO"
+        return self._remote_common_snippet(job) + "\n\n" + """
+for RAW0 in "${RAW_STARTS[@]}"; do
+  set_current_raw "$RAW0"
+  echo "INFO_START $BASE"
+  ros2 run cambuffer_recorder_ng raw_rolling_info "$RAW" > "$INFO" 2>&1
+  echo "RAW_INFO_WRITTEN $INFO"
+done
 """.strip()
 
     def _script_audit(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + f"""
-
-AUDIT_RC=0
-ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
-if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
-  cat "$AUDIT_STDOUT"
-  exit "$AUDIT_RC"
-fi
-cat > "$PROC_DIR/${{BASE}}.audit.env" <<EOF
+        return self._remote_common_snippet(job) + "\n\n" + f"""
+for RAW0 in "${{RAW_STARTS[@]}}"; do
+  set_current_raw "$RAW0"
+  echo "AUDIT_START $BASE"
+  AUDIT_RC=0
+  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
+  if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
+    cat "$AUDIT_STDOUT"
+    exit "$AUDIT_RC"
+  fi
+  cat > "$PROC_DIR/${{BASE}}.audit.env" <<EOF
 SESSION=$SESSION
 CAM=$CAM
+BASE=$BASE
 RAW=$RAW
 AUDIT=$AUDIT
 AUDIT_STDOUT=$AUDIT_STDOUT
@@ -804,24 +849,28 @@ AUDIT_RC=$AUDIT_RC
 FPS={self.fps}
 AUDIT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC"
+  echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC"
+done
 """.strip()
 
     def _script_process(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + f"""
-
-CONVERT_RC=0
-set +e
-ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$MP4" 0 {_q(self.fps)} "$META" {_q(self.r_gain)} {_q(self.g_gain)} {_q(self.b_gain)} {_q(self.gamma)} 2>&1 | tee "$CONVERT_STDOUT"
-CONVERT_RC=${{PIPESTATUS[0]}}
-set -e
-if [[ "$CONVERT_RC" != "0" ]]; then
-  exit "$CONVERT_RC"
-fi
-CONVERT_WRITTEN_FRAMES=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{{print $3}}')
-cat > "$CONVERT_ENV" <<EOF
+        return self._remote_common_snippet(job) + "\n\n" + f"""
+for RAW0 in "${{RAW_STARTS[@]}}"; do
+  set_current_raw "$RAW0"
+  echo "PROCESS_START $BASE"
+  CONVERT_RC=0
+  set +e
+  ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$MP4" 0 {_q(self.fps)} "$META" {_q(self.r_gain)} {_q(self.g_gain)} {_q(self.b_gain)} {_q(self.gamma)} 2>&1 | tee "$CONVERT_STDOUT"
+  CONVERT_RC=${{PIPESTATUS[0]}}
+  set -e
+  if [[ "$CONVERT_RC" != "0" ]]; then
+    exit "$CONVERT_RC"
+  fi
+  CONVERT_WRITTEN_FRAMES=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{{print $3}}')
+  cat > "$CONVERT_ENV" <<EOF
 SESSION=$SESSION
 CAM=$CAM
+BASE=$BASE
 RAW=$RAW
 MP4=$MP4
 CONVERT_STDOUT=$CONVERT_STDOUT
@@ -829,19 +878,20 @@ CONVERT_RC=$CONVERT_RC
 CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
 CONVERT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-AUDIT_RC=0
-ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
-if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
-  cat "$AUDIT_STDOUT"
-  exit "$AUDIT_RC"
-fi
-ros2 run cambuffer_recorder_ng raw_rolling_info "$RAW" > "$INFO" 2>&1 || true
-if [[ "$META" != "none" ]]; then
-  cp -f "$META" "$PROC_DIR/${{BASE}}.metadata.yaml"
-fi
-cat > "$PROC_DIR/${{BASE}}.process.env" <<EOF
+  AUDIT_RC=0
+  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
+  if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
+    cat "$AUDIT_STDOUT"
+    exit "$AUDIT_RC"
+  fi
+  ros2 run cambuffer_recorder_ng raw_rolling_info "$RAW" > "$INFO" 2>&1 || true
+  if [[ "$META" != "none" ]]; then
+    cp -f "$META" "$PROC_DIR/${{BASE}}.metadata.yaml"
+  fi
+  cat > "$PROC_DIR/${{BASE}}.process.env" <<EOF
 SESSION=$SESSION
 CAM=$CAM
+BASE=$BASE
 RAW=$RAW
 MP4=$MP4
 AUDIT=$AUDIT
@@ -851,82 +901,94 @@ CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
 FPS={self.fps}
 PROCESSED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-echo "PROCESSED $MP4 frames=${{CONVERT_WRITTEN_FRAMES:-unknown}} audit_rc=$AUDIT_RC"
+  echo "PROCESSED $MP4 frames=${{CONVERT_WRITTEN_FRAMES:-unknown}} audit_rc=$AUDIT_RC"
+done
 """.strip()
 
     def _script_verify(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + """
-
-if [[ ! -s "$MP4" ]]; then
-  echo "MISSING_MP4 $MP4"
+        return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + """
+mapfile -t PROCESSED_BASES < <(find "$PROC_DIR" -maxdepth 1 -type f -name '*.mp4' -printf '%f\n' | sed 's/\\.mp4$//' | sort)
+if [[ "${#PROCESSED_BASES[@]}" == "0" ]]; then
+  echo "NO_MP4_TO_VERIFY $PROC_DIR"
   exit 30
 fi
-if [[ ! -s "$AUDIT" ]]; then
-  echo "MISSING_AUDIT $AUDIT"
-  exit 31
-fi
-RAW_FRAMES=$(grep -E '^# total_frames:' "$AUDIT" | tail -n 1 | awk '{print $3}')
-if [[ -z "$RAW_FRAMES" ]]; then
-  echo "FRAME_COUNT_UNKNOWN raw=$RAW_FRAMES"
-  exit 32
-fi
-CONVERT_WRITTEN=""
-if [[ -s "$CONVERT_ENV" ]]; then
-  CONVERT_WRITTEN=$(grep -E '^CONVERT_WRITTEN_FRAMES=' "$CONVERT_ENV" | tail -n 1 | cut -d= -f2-)
-fi
-if [[ -z "$CONVERT_WRITTEN" && -s "$CONVERT_STDOUT" ]]; then
-  CONVERT_WRITTEN=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{print $3}')
-fi
-MP4_FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
-MP4_PACKETS=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
-MP4_NB_FRAMES=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
-FRAME_OK=0
-VERIFY_WARNING=""
-if [[ "$MP4_FRAMES" == "$RAW_FRAMES" ]]; then
-  FRAME_OK=1
-elif [[ "$MP4_PACKETS" == "$RAW_FRAMES" ]]; then
-  FRAME_OK=1
-  VERIFY_WARNING="nb_read_packets_matched_raw_frames mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS"
-elif [[ -n "$CONVERT_WRITTEN" && "$CONVERT_WRITTEN" == "$RAW_FRAMES" ]]; then
-  FRAME_OK=1
-  VERIFY_WARNING="converter_matched_raw_frames ffprobe_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=$CONVERT_WRITTEN"
-elif [[ "$MP4_FRAMES" =~ ^[0-9]+$ && "$RAW_FRAMES" =~ ^[0-9]+$ ]]; then
-  DELTA=$((MP4_FRAMES - RAW_FRAMES))
-  if (( DELTA < 0 )); then DELTA=$(( -DELTA )); fi
-  if (( DELTA <= 1 )); then
-    FRAME_OK=1
-    VERIFY_WARNING="ffprobe_off_by_${DELTA}_accepted raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
-  fi
-fi
-if [[ "$FRAME_OK" != "1" ]]; then
-  echo "FRAME_MISMATCH raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS nb_frames=$MP4_NB_FRAMES convert=${CONVERT_WRITTEN:-unknown}"
-  exit 33
-fi
-META_CHECK="$META"
-if [[ "$META_CHECK" == "none" ]]; then
+for BASE in "${PROCESSED_BASES[@]}"; do
+  MP4="$PROC_DIR/${BASE}.mp4"
+  AUDIT="$PROC_DIR/${BASE}.audit.csv"
+  CONVERT_STDOUT="$PROC_DIR/${BASE}.convert.stdout.txt"
+  CONVERT_ENV="$PROC_DIR/${BASE}.convert.env"
   META_CHECK="$PROC_DIR/${BASE}.metadata.yaml"
-fi
-if [[ ! -s "$META_CHECK" ]]; then
-  echo "MISSING_METADATA $META_CHECK"
-  exit 34
-fi
-PROC_METADATA="$PROC_DIR/${BASE}.metadata.yaml"
-if [[ "$META_CHECK" != "$PROC_METADATA" ]]; then
-  cp -f "$META_CHECK" "$PROC_METADATA"
-  META_CHECK="$PROC_METADATA"
-fi
-MISSING=0
-for KEY in mode camera.width camera.height camera.fps camera.pixel_format output.kind; do
-  if ! grep -q "$KEY" "$META_CHECK"; then
-    echo "MISSING_METADATA_KEY $KEY"
-    MISSING=1
+  VERIFY="$PROC_DIR/${BASE}.verify.env"
+  echo "VERIFY_START $BASE"
+
+  if [[ ! -s "$MP4" ]]; then
+    echo "MISSING_MP4 $MP4"
+    exit 30
   fi
-done
-if [[ "$MISSING" != "0" ]]; then
-  exit 35
-fi
-cat > "$VERIFY" <<EOF
+  if [[ ! -s "$AUDIT" ]]; then
+    echo "MISSING_AUDIT $AUDIT"
+    exit 31
+  fi
+  RAW_FRAMES=$(grep -E '^# total_frames:' "$AUDIT" | tail -n 1 | awk '{print $3}')
+  if [[ -z "$RAW_FRAMES" ]]; then
+    echo "FRAME_COUNT_UNKNOWN raw=$RAW_FRAMES base=$BASE"
+    exit 32
+  fi
+
+  CONVERT_WRITTEN=""
+  if [[ -s "$CONVERT_ENV" ]]; then
+    CONVERT_WRITTEN=$(grep -E '^CONVERT_WRITTEN_FRAMES=' "$CONVERT_ENV" | tail -n 1 | cut -d= -f2-)
+  fi
+  if [[ -z "$CONVERT_WRITTEN" && -s "$CONVERT_STDOUT" ]]; then
+    CONVERT_WRITTEN=$(grep -Eo '\[raw2mp4\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{print $3}')
+  fi
+
+  MP4_FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+  MP4_PACKETS=$(ffprobe -v error -count_packets -select_streams v:0 -show_entries stream=nb_read_packets -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+  MP4_NB_FRAMES=$(ffprobe -v error -select_streams v:0 -show_entries stream=nb_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
+
+  FRAME_OK=0
+  VERIFY_WARNING=""
+  if [[ "$MP4_FRAMES" == "$RAW_FRAMES" ]]; then
+    FRAME_OK=1
+  elif [[ "$MP4_PACKETS" == "$RAW_FRAMES" ]]; then
+    FRAME_OK=1
+    VERIFY_WARNING="nb_read_packets_matched_raw_frames mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS"
+  elif [[ -n "$CONVERT_WRITTEN" && "$CONVERT_WRITTEN" == "$RAW_FRAMES" ]]; then
+    FRAME_OK=1
+    VERIFY_WARNING="converter_matched_raw_frames ffprobe_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=$CONVERT_WRITTEN"
+  elif [[ "$MP4_FRAMES" =~ ^[0-9]+$ && "$RAW_FRAMES" =~ ^[0-9]+$ ]]; then
+    DELTA=$((MP4_FRAMES - RAW_FRAMES))
+    if (( DELTA < 0 )); then DELTA=$(( -DELTA )); fi
+    if (( DELTA <= 1 )); then
+      FRAME_OK=1
+      VERIFY_WARNING="ffprobe_off_by_${DELTA}_accepted raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
+    fi
+  fi
+
+  if [[ "$FRAME_OK" != "1" ]]; then
+    echo "FRAME_MISMATCH base=$BASE raw=$RAW_FRAMES mp4=$MP4_FRAMES packets=$MP4_PACKETS nb_frames=$MP4_NB_FRAMES convert=${CONVERT_WRITTEN:-unknown}"
+    exit 33
+  fi
+  if [[ ! -s "$META_CHECK" ]]; then
+    echo "MISSING_METADATA $META_CHECK"
+    exit 34
+  fi
+
+  MISSING=0
+  for KEY in mode camera.width camera.height camera.fps camera.pixel_format output.kind; do
+    if ! grep -q "$KEY" "$META_CHECK"; then
+      echo "MISSING_METADATA_KEY $KEY base=$BASE"
+      MISSING=1
+    fi
+  done
+  if [[ "$MISSING" != "0" ]]; then
+    exit 35
+  fi
+
+  cat > "$VERIFY" <<EOF
 VERIFY_OK=1
+BASE=$BASE
 RAW_FRAMES=$RAW_FRAMES
 MP4_FRAMES=$MP4_FRAMES
 MP4_PACKETS=$MP4_PACKETS
@@ -938,67 +1000,76 @@ AUDIT_SIZE_BYTES=$(stat -c %s "$AUDIT")
 METADATA=$META_CHECK
 VERIFIED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-touch "$PROC_DIR/${BASE}.VERIFY_OK"
-if [[ -n "$VERIFY_WARNING" ]]; then
-  echo "VERIFY_OK_WITH_WARNING $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown} warning=$VERIFY_WARNING"
-else
-  echo "VERIFY_OK $CAM raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
-fi
+  touch "$PROC_DIR/${BASE}.VERIFY_OK"
+  if [[ -n "$VERIFY_WARNING" ]]; then
+    echo "VERIFY_OK_WITH_WARNING $CAM base=$BASE raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown} warning=$VERIFY_WARNING"
+  else
+    echo "VERIFY_OK $CAM base=$BASE raw_frames=$RAW_FRAMES mp4_frames=$MP4_FRAMES packets=$MP4_PACKETS convert=${CONVERT_WRITTEN:-unknown}"
+  fi
+done
 """.strip()
 
     def _script_delete_raws(self, job: PipelineJob) -> str:
-        return self._remote_base_snippet(job) + "\n\n" + """
-
-if [[ ! -f "$PROC_DIR/${BASE}.VERIFY_OK" ]]; then
-  echo "REFUSING_DELETE_RAW_WITHOUT_VERIFY_OK $PROC_DIR/${BASE}.VERIFY_OK"
-  exit 40
-fi
-COUNT=$(find "$DIR" -maxdepth 1 -type f -name "${BASE}_*.cbrraw" | wc -l)
-find "$DIR" -maxdepth 1 -type f -name "${BASE}_*.cbrraw" -delete
-touch "$PROC_DIR/${BASE}.RAW_DELETED"
-echo "RAW_DELETED $CAM count=$COUNT"
+        return self._remote_common_snippet(job) + "\n\n" + """
+TOTAL_DELETED=0
+for RAW0 in "${RAW_STARTS[@]}"; do
+  set_current_raw "$RAW0"
+  if [[ ! -f "$PROC_DIR/${BASE}.VERIFY_OK" ]]; then
+    echo "REFUSING_DELETE_RAW_WITHOUT_VERIFY_OK $PROC_DIR/${BASE}.VERIFY_OK"
+    exit 40
+  fi
+  COUNT=$(find "$DIR" -maxdepth 1 -type f -name "${BASE}_*.cbrraw" | wc -l)
+  find "$DIR" -maxdepth 1 -type f -name "${BASE}_*.cbrraw" -delete
+  touch "$PROC_DIR/${BASE}.RAW_DELETED"
+  TOTAL_DELETED=$((TOTAL_DELETED + COUNT))
+  echo "RAW_DELETED $CAM base=$BASE count=$COUNT"
+done
+echo "RAW_DELETE_COMPLETE $CAM total_count=$TOTAL_DELETED"
 """.strip()
 
     def _script_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
-        return self._processed_base_snippet(job) + "\n\n" + f"""
-
+        return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + f"""
 {self._storage_shell_vars()}
-if [[ ! -f "$PROC_DIR/${{BASE}}.VERIFY_OK" ]]; then
-  echo "REFUSING_UPLOAD_WITHOUT_VERIFY_OK $PROC_DIR/${{BASE}}.VERIFY_OK"
-  exit 50
+mapfile -t MP4S < <(find "$PROC_DIR" -maxdepth 1 -type f -name '*.mp4' | sort)
+if [[ "${{#MP4S[@]}}" != "0" ]]; then
+  for MP4 in "${{MP4S[@]}}"; do
+    BASE="$(basename "${{MP4%.mp4}}")"
+    if [[ ! -f "$PROC_DIR/${{BASE}}.VERIFY_OK" ]]; then
+      echo "REFUSING_UPLOAD_WITHOUT_VERIFY_OK $PROC_DIR/${{BASE}}.VERIFY_OK"
+      exit 50
+    fi
+  done
 fi
 DEST={_q(upload_root)}/$SESSION/$CAM/processed
 ssh "${{SSH_ARGS[@]}}" "$STORAGE" "mkdir -p '$DEST'"
-touch "$PROC_DIR/${{BASE}}.UPLOADED"
+touch "$PROC_DIR/.UPLOADED"
 rsync -a --partial -e "$RSYNC_RSH" "$PROC_DIR/" "$STORAGE:$DEST/"
-echo "UPLOADED $CAM to $STORAGE:$DEST"
+echo "UPLOADED $CAM to $STORAGE:$DEST files=$(find "$PROC_DIR" -maxdepth 1 -type f | wc -l)"
 """.strip()
 
     def _script_verify_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
-        return self._processed_base_snippet(job) + "\n\n" + f"""
-
+        return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + f"""
 {self._storage_shell_vars()}
 DEST={_q(upload_root)}/$SESSION/$CAM/processed
 LOCAL_LIST=$(mktemp)
 REMOTE_LIST=$(mktemp)
-(cd "$PROC_DIR" && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' -printf '%P\t%s\n' | sort) > "$LOCAL_LIST"
-ssh "${{SSH_ARGS[@]}}" "$STORAGE" "cd '$DEST' && find . -type f -printf '%P\t%s\n' | sort" > "$REMOTE_LIST"
+(cd "$PROC_DIR" && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' -printf '%P\t%s\n' | sort) > "$LOCAL_LIST"
+ssh "${{SSH_ARGS[@]}}" "$STORAGE" "cd '$DEST' && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' -printf '%P\t%s\n' | sort" > "$REMOTE_LIST"
 if ! diff -u "$LOCAL_LIST" "$REMOTE_LIST"; then
   echo "UPLOAD_SIZE_VERIFY_FAILED $CAM"
   exit 60
 fi
-cp "$LOCAL_LIST" "$PROC_DIR/${{BASE}}.upload_sizes.tsv"
-touch "$PROC_DIR/${{BASE}}.UPLOAD_VERIFY_OK"
-echo "UPLOAD_VERIFY_OK $CAM"
+cp "$LOCAL_LIST" "$PROC_DIR/.upload_sizes.tsv"
+touch "$PROC_DIR/.UPLOAD_VERIFY_OK"
+echo "UPLOAD_VERIFY_OK $CAM files=$(wc -l < "$LOCAL_LIST")"
 """.strip()
 
     def _script_delete_uploaded_local(self, job: PipelineJob) -> str:
-        return self._processed_base_snippet(job) + "\n\n" + """
-
-if [[ ! -f "$PROC_DIR/${BASE}.UPLOAD_VERIFY_OK" ]]; then
-  echo "REFUSING_DELETE_PROCESSED_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR/${BASE}.UPLOAD_VERIFY_OK"
+        return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + """
+if [[ ! -f "$PROC_DIR/.UPLOAD_VERIFY_OK" ]]; then
+  echo "REFUSING_DELETE_PROCESSED_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR/.UPLOAD_VERIFY_OK"
   exit 70
 fi
 BYTES=$(du -sb "$PROC_DIR" | awk '{print $1}')
@@ -1270,6 +1341,11 @@ class ProcessingPanel(QtWidgets.QWidget):
 
         self.status_label = QtWidgets.QLabel("Ready.")
         self.status_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.status_label.setMinimumWidth(0)
+        self.status_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Preferred,
+        )
 
         self._build_layout()
 
@@ -1610,12 +1686,26 @@ class ProcessingPanel(QtWidgets.QWidget):
         )
         self._start_worker(self._worker, self._worker.run, self._worker.finished, self._on_pipeline_finished)
 
+    def _short_status_text(self, text: str, max_chars: int = 180) -> str:
+        text = " ".join(str(text or "").split())
+        if len(text) <= max_chars:
+            return text
+        head_chars = 70
+        tail_chars = max(40, max_chars - head_chars - 5)
+        return f"{text[:head_chars]} ... {text[-tail_chars:]}"
+
+    @QtCore.Slot(str)
+    def _set_status_text(self, text: str) -> None:
+        full = " ".join(str(text or "").split())
+        self.status_label.setToolTip(full)
+        self.status_label.setText(self._short_status_text(full))
+
     def _start_worker(self, worker: QtCore.QObject, start_slot, finished_signal, finished_slot) -> None:
         worker.moveToThread(self._thread)
         self._thread.started.connect(start_slot)
         worker.log.connect(self.log_line.emit)  # type: ignore[attr-defined]
         if hasattr(worker, "status"):
-            worker.status.connect(self.status_label.setText)  # type: ignore[attr-defined]
+            worker.status.connect(self._set_status_text)  # type: ignore[attr-defined]
         worker.progress.connect(self._on_progress)  # type: ignore[attr-defined]
         finished_signal.connect(finished_slot)
         finished_signal.connect(self._thread.quit)
@@ -1644,7 +1734,9 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(str, int, int)
     def _on_pipeline_finished(self, action: str, ok: int, done: int) -> None:
-        self.status_label.setText(f"Done: {action}: {ok}/{done} step(s) OK.")
+        self._set_status_text(f"Done: {action}: {ok}/{done} step(s) OK.")
         self._set_busy(False)
+        if action == "delete_uploaded_session_local":
+            QtCore.QTimer.singleShot(0, self.refresh_sessions)
         self._worker = None
         self._thread = None
