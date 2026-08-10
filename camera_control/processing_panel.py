@@ -809,7 +809,9 @@ class PipelineWorker(QtCore.QObject):
         if action == "info_audit":
             return ["info", "audit", "multicam_sync"]
         if action == "multicam_sync":
-            return ["multicam_sync"]
+            # Standalone GUI sync audit: generate/refresh the per-camera raw
+            # info + audit CSV prerequisites before reconstructing alignment.
+            return ["info", "audit", "multicam_sync"]
         if action == "verify":
             return ["verify"]
         if action == "delete_raws":
@@ -2436,9 +2438,24 @@ class ProcessingPanel(QtWidgets.QWidget):
             worker.status.connect(self._set_status_text)  # type: ignore[attr-defined]
         worker.progress.connect(self._on_progress)  # type: ignore[attr-defined]
         finished_signal.connect(finished_slot)
+        # The worker lives in the QThread. Do not drop the last Python
+        # reference from a GUI-thread completion slot while its thread is
+        # still winding down; that can destroy a QObject from the wrong
+        # thread and, with PySide/Qt, can surface as a native segfault.
+        # Use Qt's canonical worker-thread teardown instead.
+        finished_signal.connect(worker.deleteLater)
         finished_signal.connect(self._thread.quit)
+        self._thread.finished.connect(self._on_worker_thread_finished)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
+
+    @QtCore.Slot()
+    def _on_worker_thread_finished(self) -> None:
+        # Only release GUI-side references after QThread has actually
+        # stopped. This is also the point where a new job may safely start.
+        self._worker = None
+        self._thread = None
+        self._set_busy(False)
 
     @QtCore.Slot()
     def cancel(self) -> None:
@@ -2456,9 +2473,6 @@ class ProcessingPanel(QtWidgets.QWidget):
     @QtCore.Slot(int, int)
     def _on_thumbnail_finished(self, ok: int, done: int) -> None:
         self.status_label.setText(f"Done: copied {ok}/{done} thumbnails.")
-        self._set_busy(False)
-        self._worker = None
-        self._thread = None
 
     @QtCore.Slot(str, int, int)
     def _on_pipeline_finished(self, action: str, ok: int, done: int) -> None:
@@ -2483,8 +2497,5 @@ class ProcessingPanel(QtWidgets.QWidget):
                 counts = {name: sync_statuses.count(name) for name in sorted(set(sync_statuses))}
                 status_text += " Multi-cam: " + ", ".join(f"{key}={value}" for key, value in counts.items()) + "."
         self._set_status_text(status_text)
-        self._set_busy(False)
         if action in {"delete_uploaded_session_local", "delete_sessions"}:
             QtCore.QTimer.singleShot(0, self.refresh_sessions)
-        self._worker = None
-        self._thread = None
