@@ -2819,12 +2819,10 @@ class MainWindow(QtWidgets.QMainWindow):
         tab_preview.setLayout(preview_layout)
         self.tabs.addTab(tab_preview, "Preview")
 
-        # Auto-Run goes first and is the launch tab, so the operator lands on the
-        # one-click workflow with no tab-switching. Inserting at index 0 shifts the
-        # other tabs; goto_metadata_tab() resolves the Metadata index dynamically.
+        # Auto-Run is mounted as the last tab. It refreshes its readiness (loaded
+        # regimen + selected-camera count) each time it is shown.
         if self.autorun_panel is not None:
-            self.tabs.insertTab(0, self.autorun_panel, "▶ Auto-Run")
-            self.tabs.setCurrentIndex(0)
+            self.tabs.addTab(self.autorun_panel, "▶ Auto-Run")
 
         self.setCentralWidget(self.tabs)
 

@@ -135,6 +135,25 @@ class AutoRunController(QtCore.QObject):
     def is_active(self) -> bool:
         return self.state in _ACTIVE_STATES
 
+    def _selected_cameras(self) -> List[str]:
+        """Return the currently selected camera node names.
+
+        The real GUI exposes selection on ``camera_panel.table`` (a CameraTable);
+        the ``selected_full_names`` method is not on the panel itself. Fall back
+        gracefully so tests can inject a panel that exposes it directly.
+        """
+        panel = self.camera_panel
+        for target in (panel, getattr(panel, "table", None)):
+            if target is None:
+                continue
+            fn = getattr(target, "selected_full_names", None)
+            if callable(fn):
+                try:
+                    return list(fn())
+                except Exception:
+                    return []
+        return []
+
     def _set_state(self, state: str) -> None:
         self.state = state
         self.state_changed.emit(state, STATE_LABELS.get(state, state.upper()))
@@ -147,10 +166,7 @@ class AutoRunController(QtCore.QObject):
             fn = getattr(self.hiit_controller, "loaded_protocol", None)
             if callable(fn):
                 regimen = fn()
-        try:
-            nodes = list(self.camera_panel.selected_full_names())
-        except Exception:
-            nodes = []
+        nodes = self._selected_cameras()
         return AutoRunReadiness(
             regimen_name=getattr(regimen, "protocol_name", None) if regimen else None,
             estimated_total_s=float(getattr(regimen, "estimated_total_s", 0.0)) if regimen else 0.0,
@@ -191,7 +207,7 @@ class AutoRunController(QtCore.QObject):
             return False  # _register_metadata already reported + reset state
 
         # 3) start recording and await ROS confirmation.
-        self._nodes = list(self.camera_panel.selected_full_names())
+        self._nodes = self._selected_cameras()
         self._recording_confirmed = set()
         self._set_state(STARTING_REC)
         self._log(f"Auto-Run: starting recording on {len(self._nodes)} camera(s)")

@@ -286,3 +286,20 @@ def test_readiness_reports_regimen_and_cameras(_qapp):
     assert rd.regimen_name == "unit-regimen"
     assert rd.camera_count == 2
     assert rd.ready is True
+
+
+def test_selection_read_from_table_when_panel_lacks_method(_qapp):
+    # Mirrors the real GUI: selection lives on camera_panel.table, not the panel.
+    class _Table:
+        def selected_full_names(self):
+            return ["cam1", "cam2"]
+
+    class _PanelWithTable:
+        table = _Table()
+
+    ros = FakeRos()
+    ctrl = AutoRunController(ros, _PanelWithTable(), FakeMetadata(), FakeTreadmill(),
+                             FakeHiit(proto=True), clock=FakeClock())
+    rd = ctrl.readiness()
+    assert rd.camera_count == 2
+    assert rd.ready is True

@@ -130,6 +130,13 @@ class AutoRunPanel(QtWidgets.QWidget):
         if controller is not None:
             self.set_controller(controller)
 
+    def showEvent(self, event) -> None:
+        # Re-check readiness each time the tab is opened: the operator typically
+        # selects cameras / loads a regimen on other tabs, then switches here.
+        super().showEvent(event)
+        if self._controller is not None and not self._controller.is_active():
+            self.refresh_readiness()
+
     # --------------------------------------------------------------- wiring
     def set_controller(self, controller: autoctl.AutoRunController) -> None:
         self._controller = controller
