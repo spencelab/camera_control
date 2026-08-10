@@ -8,6 +8,7 @@ processing:
     - cam1@local
 
   conversion:
+    # MP4 playback FPS only. Raw audit acquisition FPS comes from recorded metadata.
     fps: 100.0
     r_gain: 1.63
     g_gain: 1.00

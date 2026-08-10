@@ -6,6 +6,7 @@ MERB pilot tools:
   - ask camera hosts to convert raw rolling files to MP4 in-place
   - verify MP4 frame counts against raw audit output
   - delete verified raw binaries
+  - permanently delete selected test sessions from tmill + configured camera hosts
   - upload processed camera files directly from camera hosts to storage
   - upload tmill session-level files to the same storage session directory
 
@@ -29,6 +30,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from PySide6 import QtCore, QtWidgets
+
+try:
+    from multicam_sync_audit import audit_session as run_multicam_sync_audit
+    MULTICAM_SYNC_AUDIT_AVAILABLE = True
+except Exception:
+    run_multicam_sync_audit = None
+    MULTICAM_SYNC_AUDIT_AVAILABLE = False
 
 
 def _repo_root() -> Path:
@@ -628,10 +636,24 @@ class PipelineWorker(QtCore.QObject):
     def run(self) -> None:
         action_plan = self._expand_action(self.action)
         jobs = [PipelineJob(session=s, cam=spec.cam, host=spec.host) for s in self.sessions for spec in self.camera_specs]
-        per_cam_steps = [a for a in action_plan if a not in ("upload_session", "delete_session_local")]
+        per_cam_steps = [
+            a for a in action_plan
+            if a not in (
+                "upload_session",
+                "delete_session_local",
+                "delete_session_force_local",
+                "multicam_sync",
+            )
+        ]
+        multicam_passes = 1 if "multicam_sync" in action_plan else 0
         session_upload_passes = 2 if "upload_session" in action_plan else 0
         session_delete_passes = 1 if "delete_session_local" in action_plan else 0
-        total = len(self.sessions) * (session_upload_passes + session_delete_passes) + len(jobs) * len(per_cam_steps)
+        force_session_delete_passes = 1 if "delete_session_force_local" in action_plan else 0
+        total = (
+            len(self.sessions)
+            * (session_upload_passes + session_delete_passes + force_session_delete_passes + multicam_passes)
+            + len(jobs) * len(per_cam_steps)
+        )
         total = max(1, total)
         done = 0
         ok = 0
@@ -647,6 +669,7 @@ class PipelineWorker(QtCore.QObject):
                 break
 
             session_jobs = [j for j in jobs if j.session == session]
+            force_remote_delete_ok = True
 
             if "upload_session" in action_plan:
                 if self._upload_session_level_files(session):
@@ -657,7 +680,23 @@ class PipelineWorker(QtCore.QObject):
             for step in per_cam_steps:
                 if self._cancelled:
                     break
+                done_before = done
+                ok_before = ok
                 done, ok = self._run_camera_step_group(session, session_jobs, step, done, ok, total)
+                if step == "delete_session_force":
+                    attempted = done - done_before
+                    succeeded = ok - ok_before
+                    force_remote_delete_ok = attempted == len(session_jobs) and succeeded == attempted
+
+            # Session-level sync audit is deliberately best-effort.  It runs
+            # after all requested per-camera work, records failure/incomplete
+            # state in the manifest, and never prevents the overnight pipeline
+            # from attempting later upload/verification steps.
+            if (not self._cancelled) and "multicam_sync" in action_plan:
+                if self._run_multicam_sync_audit(session):
+                    ok += 1
+                done += 1
+                self.progress.emit(done, total)
 
             if (not self._cancelled) and "upload_session" in action_plan:
                 if self._upload_session_level_files(session):
@@ -668,6 +707,26 @@ class PipelineWorker(QtCore.QObject):
             if (not self._cancelled) and "delete_session_local" in action_plan:
                 if self._delete_local_session_tree(session):
                     ok += 1
+                done += 1
+                self.progress.emit(done, total)
+
+            # Deliberately destructive cleanup for disposable test sessions.
+            # Camera-host copies are removed by the per-camera step above; tmill
+            # is deleted last so its session remains available while remote
+            # deletion results are being logged. No upload/VERIFY sentinel is
+            # required because the GUI confirmation is the safety gate.
+            if (not self._cancelled) and "delete_session_force_local" in action_plan:
+                if force_remote_delete_ok:
+                    if self._delete_local_session_force(session):
+                        ok += 1
+                else:
+                    self.log.emit(
+                        f"Processing: {session}/tmill: delete_session_force_local FAIL: "
+                        "keeping tmill session because one or more configured camera-host deletes failed"
+                    )
+                    self.status.emit(
+                        f"{session}: camera-host delete failure; tmill copy kept so the deletion can be retried"
+                    )
                 done += 1
                 self.progress.emit(done, total)
 
@@ -742,13 +801,15 @@ class PipelineWorker(QtCore.QObject):
 
     def _expand_action(self, action: str) -> List[str]:
         if action == "process":
-            return ["process"]
+            return ["process", "multicam_sync"]
         if action == "info":
             return ["info"]
         if action == "audit":
             return ["audit"]
         if action == "info_audit":
-            return ["info", "audit"]
+            return ["info", "audit", "multicam_sync"]
+        if action == "multicam_sync":
+            return ["multicam_sync"]
         if action == "verify":
             return ["verify"]
         if action == "delete_raws":
@@ -761,12 +822,14 @@ class PipelineWorker(QtCore.QObject):
             return ["delete_uploaded_local"]
         if action == "delete_uploaded_session_local":
             return ["delete_camera_session_local", "delete_session_local"]
+        if action == "delete_sessions":
+            return ["delete_session_force", "delete_session_force_local"]
         if action == "process_verify":
-            return ["process", "verify"]
+            return ["process", "verify", "multicam_sync"]
         if action == "upload_verify":
             return ["upload_session", "upload", "verify_upload"]
         if action == "process_verify_upload":
-            return ["process", "verify", "upload_session", "upload", "verify_upload"]
+            return ["process", "verify", "upload_session", "upload", "verify_upload", "multicam_sync"]
         return [action]
 
     def _run_local(self, argv: List[str], *, timeout_s: int = 600) -> subprocess.CompletedProcess:
@@ -919,6 +982,90 @@ metadata_for_prefix() {{
   echo none
 }}
 
+audit_context_for_meta() {{
+  local meta="$1"
+  python3 - "$meta" <<'PYAUDITCTX'
+import math
+import re
+import sys
+from pathlib import Path
+
+meta = sys.argv[1]
+if meta == "none":
+    print("0\tunknown\tmetadata_missing")
+    raise SystemExit(0)
+
+path = Path(meta)
+if not path.is_file():
+    print("0\tunknown\tmetadata_missing")
+    raise SystemExit(0)
+
+sections = {{}}
+try:
+    import yaml  # type: ignore
+    doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {{}}
+    root = doc.get("cambuffer_recorder_ng", doc) if isinstance(doc, dict) else {{}}
+    if isinstance(root, dict):
+        for name in ("effective_settings", "requested_settings"):
+            value = root.get(name)
+            if isinstance(value, dict):
+                sections[name] = value
+except Exception:
+    # The recorder writes these settings as a flat key/value map nested under
+    # effective_settings/requested_settings.  This tiny fallback parser keeps
+    # audit cadence recovery working even on a host without PyYAML.
+    current = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = re.match(r"^\\s{{2}}(effective_settings|requested_settings):\\s*$", line)
+        if m:
+            current = m.group(1)
+            sections.setdefault(current, {{}})
+            continue
+        if current is None:
+            continue
+        m = re.match(r"^\\s{{4}}([^:]+):\\s*(.*?)\\s*$", line)
+        if m:
+            sections[current][m.group(1).strip()] = m.group(2).strip().strip('"')
+        elif line and not line.startswith("    "):
+            current = None
+
+def boolish(v):
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "yes", "on", "1"):
+            return True
+        if s in ("false", "no", "off", "0"):
+            return False
+    return None
+
+for section_name in ("effective_settings", "requested_settings"):
+    settings = sections.get(section_name, {{}})
+    if not isinstance(settings, dict):
+        continue
+    hw = boolish(settings.get("camera.hardware_trigger"))
+    keys = (
+        ("camera.expected_hardware_fps", "camera.fps", "fps")
+        if hw is True
+        else ("camera.fps", "fps", "camera.expected_hardware_fps")
+    )
+    for key in keys:
+        try:
+            fps = float(settings.get(key))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fps) and fps > 0:
+            hw_text = "true" if hw is True else "false" if hw is False else "unknown"
+            print(f"{{fps:g}}\t{{hw_text}}\t{{section_name}}.{{key}}")
+            raise SystemExit(0)
+
+print("0\tunknown\tmetadata_keys_missing")
+PYAUDITCTX
+}}
+
 set_current_raw() {{
   RAW="$1"
   PREFIX="${{RAW%_0000.cbrraw}}"
@@ -934,6 +1081,12 @@ set_current_raw() {{
   if [[ "$META" != "none" ]]; then
     echo "METADATA_USING $META"
   fi
+  IFS=$'\t' read -r AUDIT_FPS HARDWARE_TRIGGER AUDIT_FPS_SOURCE < <(audit_context_for_meta "$META")
+  if [[ -z "$AUDIT_FPS" || "$AUDIT_FPS" == "0" ]]; then
+    echo "AUDIT_EXPECTED_FPS_UNAVAILABLE base=$BASE meta=$META source=$AUDIT_FPS_SOURCE"
+    exit 24
+  fi
+  echo "AUDIT_CONTEXT base=$BASE hardware_trigger=$HARDWARE_TRIGGER expected_fps=$AUDIT_FPS source=$AUDIT_FPS_SOURCE playback_fps={self.fps}"
 }}
 
 mapfile -t RAW_STARTS < <(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort)
@@ -1012,6 +1165,52 @@ if [[ ! -d "$DIR" ]]; then
 fi
 """.strip()
 
+    def _script_delete_session_force(self, job: PipelineJob) -> str:
+        """Permanently delete one selected session on a camera host.
+
+        This intentionally ignores processing/upload sentinel state because it
+        is for disposable test sessions. The path guards are deliberately
+        strict: SESSION must be one basename and its canonical target must be a
+        direct child of remote_sessions_root.
+        """
+        return f"""
+set -eo pipefail
+SESSION={_q(job.session)}
+ROOT={_q(self.remote_sessions_root)}
+
+case "$SESSION" in
+  ""|"."|".."|*/*)
+    echo "REFUSING_DANGEROUS_SESSION_NAME session=$SESSION"
+    exit 90
+    ;;
+esac
+
+ROOT_ABS=$(realpath -m -- "$ROOT")
+DIR_ABS=$(realpath -m -- "$ROOT/$SESSION")
+PARENT_ABS=$(dirname -- "$DIR_ABS")
+
+if [[ -z "$ROOT_ABS" || "$ROOT_ABS" == "/" || "$PARENT_ABS" != "$ROOT_ABS" || "$DIR_ABS" == "$ROOT_ABS" ]]; then
+  echo "REFUSING_DANGEROUS_SESSION_PATH root=$ROOT_ABS target=$DIR_ABS parent=$PARENT_ABS"
+  exit 91
+fi
+
+if [[ ! -e "$DIR_ABS" ]]; then
+  echo "SESSION_ALREADY_ABSENT $DIR_ABS"
+  exit 0
+fi
+
+BYTES=$(du -sb -- "$DIR_ABS" 2>/dev/null | awk '{{print $1}}' || true)
+FILES=$(find "$DIR_ABS" -type f 2>/dev/null | wc -l || true)
+rm -rf --one-file-system -- "$DIR_ABS"
+
+if [[ -e "$DIR_ABS" ]]; then
+  echo "SESSION_DELETE_FAILED target=$DIR_ABS"
+  exit 92
+fi
+
+echo "SESSION_DELETED target=$DIR_ABS bytes=${{BYTES:-unknown}} files=${{FILES:-unknown}}"
+""".strip()
+
     def _script_delete_camera_session_local(self, job: PipelineJob) -> str:
         return self._camera_session_snippet(job) + "\n\n" + """
 
@@ -1065,10 +1264,13 @@ for RAW0 in "${{RAW_STARTS[@]}}"; do
   set_current_raw "$RAW0"
   echo "AUDIT_START $BASE"
   AUDIT_RC=0
-  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
+  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" "$AUDIT_FPS" {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
   if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
     cat "$AUDIT_STDOUT"
     exit "$AUDIT_RC"
+  fi
+  if [[ "$META" != "none" ]]; then
+    cp -f "$META" "$PROC_DIR/${{BASE}}.metadata.yaml"
   fi
   cat > "$PROC_DIR/${{BASE}}.audit.env" <<EOF
 SESSION=$SESSION
@@ -1078,10 +1280,13 @@ RAW=$RAW
 AUDIT=$AUDIT
 AUDIT_STDOUT=$AUDIT_STDOUT
 AUDIT_RC=$AUDIT_RC
-FPS={self.fps}
+PLAYBACK_FPS={self.fps}
+AUDIT_EXPECTED_FPS=$AUDIT_FPS
+HARDWARE_TRIGGER=$HARDWARE_TRIGGER
+AUDIT_FPS_SOURCE=$AUDIT_FPS_SOURCE
 AUDIT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-  echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC"
+  echo "AUDIT_WRITTEN $AUDIT audit_rc=$AUDIT_RC expected_fps=$AUDIT_FPS hardware_trigger=$HARDWARE_TRIGGER"
 done
 """.strip()
 
@@ -1111,7 +1316,7 @@ CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
 CONVERT_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
   AUDIT_RC=0
-  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" {_q(self.fps)} {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
+  ros2 run cambuffer_recorder_ng raw_rolling_audit "$RAW" "$AUDIT" "$AUDIT_FPS" {_q(self.audit_threshold_frames)} 0 > "$AUDIT_STDOUT" 2>&1 || AUDIT_RC=$?
   if [[ "$AUDIT_RC" != "0" && "$AUDIT_RC" != "3" ]]; then
     cat "$AUDIT_STDOUT"
     exit "$AUDIT_RC"
@@ -1131,9 +1336,13 @@ AUDIT_RC=$AUDIT_RC
 CONVERT_STDOUT=$CONVERT_STDOUT
 CONVERT_WRITTEN_FRAMES=$CONVERT_WRITTEN_FRAMES
 FPS={self.fps}
+PLAYBACK_FPS={self.fps}
+AUDIT_EXPECTED_FPS=$AUDIT_FPS
+HARDWARE_TRIGGER=$HARDWARE_TRIGGER
+AUDIT_FPS_SOURCE=$AUDIT_FPS_SOURCE
 PROCESSED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
-  echo "PROCESSED $MP4 frames=${{CONVERT_WRITTEN_FRAMES:-unknown}} audit_rc=$AUDIT_RC"
+  echo "PROCESSED $MP4 frames=${{CONVERT_WRITTEN_FRAMES:-unknown}} audit_rc=$AUDIT_RC audit_expected_fps=$AUDIT_FPS"
 done
 """.strip()
 
@@ -1172,7 +1381,7 @@ for BASE in "${PROCESSED_BASES[@]}"; do
     CONVERT_WRITTEN=$(grep -E '^CONVERT_WRITTEN_FRAMES=' "$CONVERT_ENV" | tail -n 1 | cut -d= -f2-)
   fi
   if [[ -z "$CONVERT_WRITTEN" && -s "$CONVERT_STDOUT" ]]; then
-    CONVERT_WRITTEN=$(grep -Eo '\[raw2mp4\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{print $3}')
+    CONVERT_WRITTEN=$(grep -Eo '\\[raw2mp4\\] wrote [0-9]+ frames' "$CONVERT_STDOUT" | tail -n 1 | awk '{print $3}')
   fi
 
   MP4_FRAMES=$(ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames -of default=nokey=1:noprint_wrappers=1 "$MP4" | tail -n 1)
@@ -1328,6 +1537,8 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             return self._script_delete_uploaded_local(job)
         if step == "delete_camera_session_local":
             return self._script_delete_camera_session_local(job)
+        if step == "delete_session_force":
+            return self._script_delete_session_force(job)
         raise ValueError(f"unknown processing step: {step}")
 
     def _append_manifest(self, session: str, cam: str, step: str, ok: bool, detail: str) -> None:
@@ -1361,6 +1572,55 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
         self._append_manifest(job.session, job.cam, step, ok, _tail(out, 8))
         return ok
 
+    def _run_multicam_sync_audit(self, session: str) -> bool:
+        local_dir = self.base_dir / session
+        if not MULTICAM_SYNC_AUDIT_AVAILABLE or run_multicam_sync_audit is None:
+            msg = "MULTICAM_SYNC_AUDIT_UNAVAILABLE import failed"
+            self.log.emit(f"Processing: {session}/multicam: FAIL: {msg}")
+            self._append_manifest(session, "multicam", "multicam_sync", False, msg)
+            return False
+        if not local_dir.is_dir():
+            msg = f"NO_LOCAL_SESSION_DIR {local_dir}"
+            self.log.emit(f"Processing: {session}/multicam: FAIL: {msg}")
+            self._append_manifest(session, "multicam", "multicam_sync", False, msg)
+            return False
+
+        camera_hosts = {spec.cam: spec.host for spec in self.camera_specs}
+        self.status.emit(f"{session}: auditing multi-camera trigger alignment...")
+        self.log.emit(
+            f"Processing: {session}/multicam: collecting per-camera audit inputs and reconstructing shared trigger axis"
+        )
+        try:
+            result = run_multicam_sync_audit(
+                local_dir,
+                expected_cameras=[spec.cam for spec in self.camera_specs],
+                camera_hosts=camera_hosts,
+                remote_sessions_root=self.remote_sessions_root,
+                processed_subdir=self.processed_subdir,
+                collect=True,
+                log=lambda text: self.log.emit(f"Processing: {session}/multicam: {text}"),
+            )
+        except Exception as exc:
+            msg = f"MULTICAM_SYNC_EXCEPTION {exc}"
+            self.log.emit(f"Processing: {session}/multicam: FAIL: {msg}")
+            self._append_manifest(session, "multicam", "multicam_sync", False, msg)
+            return False
+
+        detail = (
+            f"{result.headline}; valid={result.valid_frames}/{result.total_common_frames} "
+            f"({result.valid_percent:.3f}%); report={result.report_path}"
+        )
+        self._append_manifest(session, "multicam", "multicam_sync", result.ok, detail)
+        if result.ok:
+            self.log.emit(f"Processing: {session}/multicam: OK: {detail}")
+            self.status.emit(f"{session}: {result.headline} ({result.valid_percent:.3f}% valid)")
+            return True
+
+        errors = "; ".join(result.errors[:4]) if result.errors else result.status
+        self.log.emit(f"Processing: {session}/multicam: NOT PASSING: {result.headline}: {errors}")
+        self.status.emit(f"{session}: {result.headline}: {errors}")
+        return False
+
     def _upload_session_level_files(self, session: str) -> bool:
         local_dir = self.base_dir / session
         if not local_dir.is_dir():
@@ -1390,7 +1650,7 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
             p = local_dir / name
             if p.exists():
                 upload_items.append(p)
-        for subdir in [self.thumbnails_subdir, "rosbag"]:
+        for subdir in [self.thumbnails_subdir, "rosbag", "multicam_sync"]:
             p = local_dir / subdir
             if p.exists():
                 upload_items.append(p)
@@ -1517,6 +1777,59 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
         self.log.emit(f"Processing: {session}/tmill: upload_session OK: {msg}")
         return True
 
+
+    def _delete_local_session_force(self, session: str) -> bool:
+        """Permanently delete one selected tmill session with strict path guards."""
+        if not session or session in {".", ".."} or "/" in session or "\\" in session:
+            self.log.emit(f"Processing: {session}/tmill: delete_session_force_local FAIL: unsafe session name")
+            return False
+
+        try:
+            root = self.base_dir.expanduser().resolve()
+            target = (root / session).resolve()
+        except Exception as exc:
+            self.log.emit(
+                f"Processing: {session}/tmill: delete_session_force_local FAIL: path resolution failed: {exc}"
+            )
+            return False
+
+        if root == Path("/") or target == root or target.parent != root:
+            self.log.emit(
+                f"Processing: {session}/tmill: delete_session_force_local FAIL: "
+                f"REFUSING_DANGEROUS_SESSION_PATH root={root} target={target}"
+            )
+            return False
+
+        if not target.exists():
+            self.log.emit(f"Processing: {session}/tmill: delete_session_force_local OK: already absent {target}")
+            return True
+
+        try:
+            byte_count = sum(p.stat().st_size for p in target.rglob("*") if p.is_file())
+            file_count = sum(1 for p in target.rglob("*") if p.is_file())
+        except Exception:
+            byte_count = -1
+            file_count = -1
+
+        try:
+            shutil.rmtree(target)
+        except Exception as exc:
+            self.log.emit(
+                f"Processing: {session}/tmill: delete_session_force_local FAIL: could not delete {target}: {exc}"
+            )
+            return False
+
+        if target.exists():
+            self.log.emit(
+                f"Processing: {session}/tmill: delete_session_force_local FAIL: target still exists {target}"
+            )
+            return False
+
+        self.log.emit(
+            f"Processing: {session}/tmill: delete_session_force_local OK: "
+            f"deleted {target} bytes={byte_count} files={file_count}"
+        )
+        return True
 
     def _delete_local_session_tree(self, session: str) -> bool:
         """Delete the controller/local copy of an uploaded session.
@@ -1680,12 +1993,22 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.info_btn = QtWidgets.QPushButton("Run raw info")
         self.audit_btn = QtWidgets.QPushButton("Run raw audit")
         self.info_audit_btn = QtWidgets.QPushButton("Info + audit")
+        self.multicam_audit_btn = QtWidgets.QPushButton("Audit multi-cam sync")
         self.verify_btn = QtWidgets.QPushButton("Verify processed")
         self.delete_raws_btn = QtWidgets.QPushButton("Delete verified raws")
         self.upload_btn = QtWidgets.QPushButton("Upload processed")
         self.verify_upload_btn = QtWidgets.QPushButton("Verify upload")
         self.delete_uploaded_local_btn = QtWidgets.QPushButton("Delete local uploaded files")
         self.delete_uploaded_session_local_btn = QtWidgets.QPushButton("Delete uploaded session copies")
+        self.delete_sessions_btn = QtWidgets.QPushButton("DELETE SELECTED SESSIONS")
+        self.delete_sessions_btn.setToolTip(
+            "Permanently delete selected session folders from tmill and all configured camera hosts. "
+            "No processing or upload verification is required."
+        )
+        self.delete_sessions_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; color: white; background-color: #b00020; padding: 6px 10px; }"
+            "QPushButton:disabled { color: #dddddd; background-color: #777777; }"
+        )
         self.process_verify_btn = QtWidgets.QPushButton("Process + verify")
         self.upload_verify_btn = QtWidgets.QPushButton("Upload + verify")
         self.process_to_upload_btn = QtWidgets.QPushButton("Process + verify + upload")
@@ -1719,12 +2042,14 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.info_btn.clicked.connect(lambda: self.run_pipeline("info"))
         self.audit_btn.clicked.connect(lambda: self.run_pipeline("audit"))
         self.info_audit_btn.clicked.connect(lambda: self.run_pipeline("info_audit"))
+        self.multicam_audit_btn.clicked.connect(lambda: self.run_pipeline("multicam_sync"))
         self.verify_btn.clicked.connect(lambda: self.run_pipeline("verify"))
         self.delete_raws_btn.clicked.connect(lambda: self.run_pipeline("delete_raws"))
         self.upload_btn.clicked.connect(lambda: self.run_pipeline("upload"))
         self.verify_upload_btn.clicked.connect(lambda: self.run_pipeline("verify_upload"))
         self.delete_uploaded_local_btn.clicked.connect(lambda: self.run_pipeline("delete_uploaded_local"))
         self.delete_uploaded_session_local_btn.clicked.connect(lambda: self.run_pipeline("delete_uploaded_session_local"))
+        self.delete_sessions_btn.clicked.connect(lambda: self.run_pipeline("delete_sessions"))
         self.process_verify_btn.clicked.connect(lambda: self.run_pipeline("process_verify"))
         self.upload_verify_btn.clicked.connect(lambda: self.run_pipeline("upload_verify"))
         self.process_to_upload_btn.clicked.connect(lambda: self.run_pipeline("process_verify_upload"))
@@ -1746,7 +2071,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         top.addRow("Camera map", self.cameras_edit)
 
         wb = QtWidgets.QHBoxLayout()
-        wb.addWidget(QtWidgets.QLabel("FPS"))
+        wb.addWidget(QtWidgets.QLabel("MP4 playback FPS"))
         wb.addWidget(self.fps_spin)
         wb.addWidget(QtWidgets.QLabel("R"))
         wb.addWidget(self.r_spin)
@@ -1783,6 +2108,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         buttons1.addWidget(self.info_btn)
         buttons1.addWidget(self.audit_btn)
         buttons1.addWidget(self.info_audit_btn)
+        buttons1.addWidget(self.multicam_audit_btn)
         buttons1.addWidget(self.verify_btn)
         buttons1.addWidget(self.delete_raws_btn)
         buttons1.addStretch(1)
@@ -1794,6 +2120,13 @@ class ProcessingPanel(QtWidgets.QWidget):
         buttons2.addWidget(self.delete_uploaded_session_local_btn)
         buttons2.addStretch(1)
 
+        danger_buttons = QtWidgets.QHBoxLayout()
+        danger_buttons.addWidget(self.delete_sessions_btn)
+        danger_buttons.addWidget(
+            QtWidgets.QLabel("Permanently removes selected sessions from tmill + configured camera hosts; storage is untouched.")
+        )
+        danger_buttons.addStretch(1)
+
         buttons3 = QtWidgets.QHBoxLayout()
         buttons3.addWidget(self.process_verify_btn)
         buttons3.addWidget(self.upload_verify_btn)
@@ -1804,10 +2137,14 @@ class ProcessingPanel(QtWidgets.QWidget):
         hint = QtWidgets.QLabel(
             "Camera map examples: cam1@local for one-box testing, or cam1@cam1 cam2@cam2 ... for MERB. "
             "Heavy processing runs on each camera host. Cameras upload their processed files directly to storage. "
-            "tmill uploads session.yaml, thumbnails, processing_manifest.tsv, and rosbag/ if present. "
+            "tmill uploads session.yaml, thumbnails, processing_manifest.tsv, rosbag/, and multicam_sync/ if present. "
+            "The conversion FPS is MP4 playback speed; raw audit acquisition FPS is recovered from each recording's metadata. "
             "Run raw info/audit writes non-destructive diagnostics into each camera processed/ folder. "
-            "Delete buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files. "
-            "Delete uploaded session copies removes selected local session folders after upload verification and refuses if raw binaries remain."
+            "Process and Process + verify paths also safely attempt the session-level multi-camera sync audit. "
+            "Normal cleanup buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files. "
+            "Delete uploaded session copies removes selected local session folders after upload verification and refuses if raw binaries remain. "
+            "DELETE SELECTED SESSIONS is intentionally destructive for disposable tests: after a prominent confirmation it deletes the "
+            "selected session from tmill and every configured camera host without requiring processing/upload sentinels; storage is untouched."
         )
         hint.setWordWrap(True)
 
@@ -1816,6 +2153,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         layout.addLayout(top)
         layout.addLayout(buttons1)
         layout.addLayout(buttons2)
+        layout.addLayout(danger_buttons)
         layout.addLayout(buttons3)
         layout.addWidget(hint)
         layout.addWidget(QtWidgets.QLabel("Sessions"))
@@ -1934,9 +2272,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         for widget in [
             self.processing_profile_combo, self.reload_profiles_btn, self.load_config_btn,
             self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
-            self.audit_btn, self.info_audit_btn, self.verify_btn,
+            self.audit_btn, self.info_audit_btn, self.multicam_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
-            self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn,
+            self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn, self.delete_sessions_btn,
             self.process_verify_btn, self.upload_verify_btn, self.process_to_upload_btn,
         ]:
             widget.setEnabled(not busy)
@@ -2003,6 +2341,31 @@ class ProcessingPanel(QtWidgets.QWidget):
         if not cameras:
             self.status_label.setText("No camera hosts/nodes configured.")
             return
+
+        if action == "delete_sessions":
+            session_lines = "<br>".join(f"• {s}" for s in sessions)
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Icon.Critical)
+            box.setWindowTitle("DANGER: Permanently delete selected sessions")
+            box.setTextFormat(QtCore.Qt.TextFormat.RichText)
+            box.setText(
+                f"<h2>PERMANENTLY DELETE {len(sessions)} SELECTED SESSION(S)?</h2>"
+                "<p><b>This cannot be undone.</b></p>"
+                "<p>The selected session folder(s) will be removed from <b>tmill</b> and "
+                "<b>every configured camera host</b>. Raw files, MP4s, metadata, rosbag data, "
+                "and any other local session contents will be deleted.</p>"
+                "<p><b>The storage/upload server is NOT touched.</b></p>"
+                f"<p>{session_lines}</p>"
+            )
+            cancel_button = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+            delete_label = f"DELETE {len(sessions)} SESSION" + ("S" if len(sessions) != 1 else "")
+            delete_button = box.addButton(delete_label, QtWidgets.QMessageBox.ButtonRole.DestructiveRole)
+            box.setDefaultButton(cancel_button)
+            box.setEscapeButton(cancel_button)
+            box.exec()
+            if box.clickedButton() is not delete_button:
+                self.status_label.setText("Session deletion cancelled. Nothing was deleted.")
+                return
 
         if action == "delete_uploaded_session_local":
             session_text = ", ".join(sessions[:5])
@@ -2099,9 +2462,29 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(str, int, int)
     def _on_pipeline_finished(self, action: str, ok: int, done: int) -> None:
-        self._set_status_text(f"Done: {action}: {ok}/{done} step(s) OK.")
+        status_text = f"Done: {action}: {ok}/{done} step(s) OK."
+        if action in {"multicam_sync", "process", "info_audit", "process_verify", "process_verify_upload"}:
+            sync_statuses: List[str] = []
+            sync_headlines: List[str] = []
+            for session in self._selected_sessions():
+                summary = self._base_dir() / session / "multicam_sync" / "multicam_sync_summary.yaml"
+                if not summary.is_file():
+                    continue
+                try:
+                    import yaml  # type: ignore
+                    data = yaml.safe_load(summary.read_text(encoding="utf-8")) or {}
+                    sync_statuses.append(str(data.get("status", "unknown")))
+                    sync_headlines.append(str(data.get("headline", "")))
+                except Exception:
+                    continue
+            if len(sync_headlines) == 1 and sync_headlines[0]:
+                status_text += f" Multi-cam: {sync_headlines[0]}."
+            elif sync_statuses:
+                counts = {name: sync_statuses.count(name) for name in sorted(set(sync_statuses))}
+                status_text += " Multi-cam: " + ", ".join(f"{key}={value}" for key, value in counts.items()) + "."
+        self._set_status_text(status_text)
         self._set_busy(False)
-        if action == "delete_uploaded_session_local":
+        if action in {"delete_uploaded_session_local", "delete_sessions"}:
             QtCore.QTimer.singleShot(0, self.refresh_sessions)
         self._worker = None
         self._thread = None

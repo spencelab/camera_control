@@ -12,6 +12,7 @@ processing:
     - cam5@cam5
 
   conversion:
+    # MP4 playback FPS only. Raw audit acquisition FPS comes from recorded metadata.
     fps: 10.0
     r_gain: 1.23
     g_gain: 1.00

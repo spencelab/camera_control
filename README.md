@@ -55,3 +55,71 @@ python3 tools/plot_treadmill_bag.py ~/camera_sessions/<session> --show
 The script writes `rosbag/treadmill_speed_sanity.png` and CSV. If no physical
 speed reports were present, it says so explicitly while still plotting the
 commanded HIIT profile.
+
+# Multi-camera synchronization audit
+
+The Processing tab has an **Audit multi-cam sync** action. The same analysis is
+automatically and safely attempted after per-camera processing for **Process
+raws**, **Info + audit**, **Process + verify**, and **Process + verify + upload**.
+A failed/incomplete multi-camera audit is recorded in `processing_manifest.tsv`
+but does not abort later overnight pipeline attempts.
+
+Each camera's raw audit uses the acquisition cadence stored with that recording:
+
+1. `effective_settings.camera.expected_hardware_fps` when hardware trigger is on
+2. `effective_settings.camera.fps`
+3. the same keys under `requested_settings`
+
+The `conversion.fps` value in `processing*.yaml` is **MP4 playback FPS only**.
+For example, a 100 Hz acquisition transcoded at 10 fps is a 10x slow-motion
+movie, but its raw trigger audit is still performed at 100 Hz.
+
+Session-level outputs are written under:
+
+```text
+~/camera_sessions/<session>/multicam_sync/
+  multicam_sync_report.txt
+  multicam_sync_summary.yaml
+  multicam_sync_alignment.csv
+  inputs/<cam>/...audit.csv + metadata...
+  MULTICAM_SYNC_PASS
+  # or MULTICAM_SYNC_PASS_WITH_EXCLUSIONS / FAIL / INCOMPLETE
+```
+
+`multicam_sync_alignment.csv` contains the shared global trigger, synchronized
+frame index, each camera's MP4/raw frame index, frame number and timestamps, plus
+`all_cameras_valid`. Missing frames therefore remain explicitly addressable
+without accumulating movie de-sync.
+
+The tool can also be run directly on a consolidated session directory:
+
+```bash
+cd ~/ros2_ws/src/camera_control
+python3 camera_control/multicam_sync_audit.py ~/camera_sessions/<session>
+```
+
+On the acquisition/master computer, it can collect the audit inputs directly
+from camera hosts first:
+
+```bash
+python3 camera_control/multicam_sync_audit.py \
+  ~/camera_sessions/<session> \
+  --camera cam1@cam1 \
+  --camera cam2@cam2 \
+  --camera cam3@cam3 \
+  --camera cam4@cam4 \
+  --collect
+```
+
+PASS and PASS WITH EXCLUSIONS return shell exit code 0. FAIL returns 1 and
+incomplete/missing-input audits return 2.
+
+## Disposable-session cleanup
+
+The Processing tab also has a red **DELETE SELECTED SESSIONS** action for test
+runs that should never be processed or uploaded. After a prominent destructive
+confirmation, it removes the selected session directory from tmill and every
+configured camera host. The upload/storage server is never touched. The delete
+uses strict path guards, treats already-absent remote copies as success, and
+keeps the tmill session if any configured camera-host delete fails so the
+operation remains visible and retryable.
