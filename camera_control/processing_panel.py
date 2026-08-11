@@ -670,6 +670,7 @@ class PipelineWorker(QtCore.QObject):
 
             session_jobs = [j for j in jobs if j.session == session]
             force_remote_delete_ok = True
+            uploaded_camera_cleanup_ok = True
 
             if "upload_session" in action_plan:
                 if self._upload_session_level_files(session):
@@ -683,15 +684,13 @@ class PipelineWorker(QtCore.QObject):
                 done_before = done
                 ok_before = ok
                 done, ok = self._run_camera_step_group(session, session_jobs, step, done, ok, total)
+                attempted = done - done_before
+                succeeded = ok - ok_before
                 if step == "delete_session_force":
-                    attempted = done - done_before
-                    succeeded = ok - ok_before
                     force_remote_delete_ok = attempted == len(session_jobs) and succeeded == attempted
+                if step == "delete_camera_session_local":
+                    uploaded_camera_cleanup_ok = attempted == len(session_jobs) and succeeded == attempted
 
-            # Session-level sync audit is deliberately best-effort.  It runs
-            # after all requested per-camera work, records failure/incomplete
-            # state in the manifest, and never prevents the overnight pipeline
-            # from attempting later upload/verification steps.
             if (not self._cancelled) and "multicam_sync" in action_plan:
                 if self._run_multicam_sync_audit(session):
                     ok += 1
@@ -705,16 +704,19 @@ class PipelineWorker(QtCore.QObject):
                 self.progress.emit(done, total)
 
             if (not self._cancelled) and "delete_session_local" in action_plan:
-                if self._delete_local_session_tree(session):
+                if "delete_camera_session_local" in action_plan and not uploaded_camera_cleanup_ok:
+                    msg = (
+                        "KEEPING_TMILL_SESSION_CAMERA_CLEANUP_FAILED "
+                        "one or more camera-host session folders were not deleted"
+                    )
+                    self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+                    self.status.emit(f"{session}: camera cleanup failed; tmill copy kept so cleanup can be retried")
+                    self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+                elif self._delete_local_session_tree(session):
                     ok += 1
                 done += 1
                 self.progress.emit(done, total)
 
-            # Deliberately destructive cleanup for disposable test sessions.
-            # Camera-host copies are removed by the per-camera step above; tmill
-            # is deleted last so its session remains available while remote
-            # deletion results are being logged. No upload/VERIFY sentinel is
-            # required because the GUI confirmation is the safety gate.
             if (not self._cancelled) and "delete_session_force_local" in action_plan:
                 if force_remote_delete_ok:
                     if self._delete_local_session_force(session):
@@ -1214,40 +1216,101 @@ echo "SESSION_DELETED target=$DIR_ABS bytes=${{BYTES:-unknown}} files=${{FILES:-
 """.strip()
 
     def _script_delete_camera_session_local(self, job: PipelineJob) -> str:
-        return self._camera_session_snippet(job) + "\n\n" + """
+        upload_root = self.upload_root
+        return self._camera_session_snippet(job) + "\n\n" + f"""
+{self._storage_shell_vars()}
+UPLOAD_ROOT={_q(upload_root)}
+REMOTE_SESSION="$UPLOAD_ROOT/$SESSION"
+REMOTE_PROC="$REMOTE_SESSION/$CAM/$PROCESSED_SUBDIR"
+LOCAL_UPLOAD_MARKER="$DIR/${{CAM}}.PROCESSED_UPLOAD_VERIFIED"
 
-RAW_COUNT=$(find "$DIR" -maxdepth 1 -type f -name '*.cbrraw' | wc -l)
-if [[ "$RAW_COUNT" != "0" ]]; then
-  echo "REFUSING_DELETE_CAMERA_SESSION_WITH_RAW_FILES $DIR raw_count=$RAW_COUNT"
-  echo "Run Delete verified raws first."
-  exit 80
+LOCAL_PROCESSED_UPLOAD_OK=0
+if [[ -f "$PROC_DIR/.UPLOAD_VERIFY_OK" || -f "$LOCAL_UPLOAD_MARKER" ]]; then
+  LOCAL_PROCESSED_UPLOAD_OK=1
 fi
 
-# If processed/ still exists, require upload verification before deleting it.
-# If processed/ is already gone, this step is allowed so leftover metadata/png
-# crumbs can be removed after Delete local uploaded files.
-if [[ -d "$PROC_DIR" ]]; then
-  UPLOAD_OK=$(find "$PROC_DIR" -maxdepth 1 -type f -name '*.UPLOAD_VERIFY_OK' | sort | head -n 1)
-  if [[ -z "$UPLOAD_OK" ]]; then
-    echo "REFUSING_DELETE_CAMERA_SESSION_WITHOUT_UPLOAD_VERIFY_OK $PROC_DIR"
-    exit 81
-  fi
+REMOTE_SESSION_OK=0
+if ssh "${{SSH_ARGS[@]}}" "$STORAGE" "test -f '$REMOTE_SESSION/.SESSION_UPLOAD_VERIFY_OK'"; then
+  REMOTE_SESSION_OK=1
 fi
 
-BYTES=$(du -sb "$DIR" | awk '{print $1}')
+if [[ -d "$PROC_DIR" && "$LOCAL_PROCESSED_UPLOAD_OK" != "1" ]]; then
+  echo "REFUSING_DELETE_CAMERA_SESSION_WITH_UNVERIFIED_PROCESSED_DIR $PROC_DIR"
+  echo "Run Verify upload first, then Delete local uploaded files or Delete uploaded session copies."
+  exit 81
+fi
+
+mapfile -t RAW_STARTS < <(find "$DIR" -maxdepth 1 -type f -name '*_0000.cbrraw' | sort)
+RAW_START_COUNT=${{#RAW_STARTS[@]}}
+TOTAL_RAW_FILES=$(find "$DIR" -maxdepth 1 -type f -name '*.cbrraw' | wc -l)
+
+if [[ "$RAW_START_COUNT" != "0" ]]; then
+  for RAW0 in "${{RAW_STARTS[@]}}"; do
+    BASE="$(basename "${{RAW0%_0000.cbrraw}}")"
+    LOCAL_VERIFY_OK=0
+    REMOTE_VERIFY_OK=0
+
+    if [[ -f "$PROC_DIR/${{BASE}}.VERIFY_OK" && -s "$PROC_DIR/${{BASE}}.mp4" ]]; then
+      LOCAL_VERIFY_OK=1
+    fi
+
+    if [[ "$REMOTE_SESSION_OK" == "1" ]]; then
+      if ssh "${{SSH_ARGS[@]}}" "$STORAGE" "test -f '$REMOTE_PROC/$BASE.VERIFY_OK' && test -s '$REMOTE_PROC/$BASE.mp4'"; then
+        REMOTE_VERIFY_OK=1
+      fi
+    fi
+
+    if [[ "$LOCAL_VERIFY_OK" != "1" && "$REMOTE_VERIFY_OK" != "1" ]]; then
+      echo "REFUSING_DELETE_CAMERA_SESSION_RAW_NOT_VERIFIED base=$BASE local=$LOCAL_VERIFY_OK remote=$REMOTE_VERIFY_OK dir=$DIR"
+      echo "Need local processed/${{BASE}}.VERIFY_OK or verified uploaded copy at $STORAGE:$REMOTE_PROC/${{BASE}}.VERIFY_OK"
+      exit 80
+    fi
+  done
+
+  TOTAL_DELETED=0
+  for RAW0 in "${{RAW_STARTS[@]}}"; do
+    BASE="$(basename "${{RAW0%_0000.cbrraw}}")"
+    COUNT=$(find "$DIR" -maxdepth 1 -type f -name "${{BASE}}_*.cbrraw" | wc -l)
+    find "$DIR" -maxdepth 1 -type f -name "${{BASE}}_*.cbrraw" -delete
+    TOTAL_DELETED=$((TOTAL_DELETED + COUNT))
+    echo "RAW_DELETED_DURING_CAMERA_SESSION_DELETE $CAM base=$BASE count=$COUNT"
+  done
+else
+  TOTAL_DELETED=0
+fi
+
+REMAINING_RAW_COUNT=$(find "$DIR" -maxdepth 1 -type f -name '*.cbrraw' | wc -l)
+if [[ "$REMAINING_RAW_COUNT" != "0" ]]; then
+  echo "REFUSING_DELETE_CAMERA_SESSION_RAW_FILES_REMAIN $DIR raw_count=$REMAINING_RAW_COUNT"
+  exit 82
+fi
+
+if [[ ! -d "$PROC_DIR" && "$LOCAL_PROCESSED_UPLOAD_OK" != "1" && "$REMOTE_SESSION_OK" != "1" ]]; then
+  echo "REFUSING_DELETE_CAMERA_SESSION_WITHOUT_UPLOAD_EVIDENCE dir=$DIR storage=$STORAGE:$REMOTE_SESSION"
+  exit 83
+fi
+
+BYTES=$(du -sb "$DIR" | awk '{{print $1}}')
 FILES=$(find "$DIR" -type f | wc -l)
 PARENT=$(dirname "$DIR")
-TOMBSTONE="$PARENT/${CAM}.LOCAL_CAMERA_SESSION_DELETED"
+TOMBSTONE="$PARENT/${{CAM}}.LOCAL_CAMERA_SESSION_DELETED"
 cat > "$TOMBSTONE" <<EOF
 SESSION=$SESSION
 CAM=$CAM
 DIR=$DIR
 BYTES=$BYTES
 FILES=$FILES
+RAW_STARTS=$RAW_START_COUNT
+RAW_FILES_BEFORE=$TOTAL_RAW_FILES
+RAW_FILES_DELETED=$TOTAL_DELETED
+LOCAL_PROCESSED_UPLOAD_OK=$LOCAL_PROCESSED_UPLOAD_OK
+REMOTE_SESSION_OK=$REMOTE_SESSION_OK
+STORAGE=$STORAGE
+REMOTE_PROC=$REMOTE_PROC
 DELETED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 EOF
 rm -rf "$DIR"
-echo "LOCAL_CAMERA_SESSION_DELETED $CAM bytes=$BYTES files=$FILES dir=$DIR"
+echo "LOCAL_CAMERA_SESSION_DELETED $CAM bytes=$BYTES files=$FILES raw_deleted=$TOTAL_DELETED dir=$DIR"
 """.strip()
 
     def _script_info(self, job: PipelineJob) -> str:
@@ -1506,6 +1569,11 @@ if ! diff -u "$LOCAL_LIST" "$REMOTE_LIST"; then
 fi
 cp "$LOCAL_LIST" "$PROC_DIR/.upload_sizes.tsv"
 touch "$PROC_DIR/.UPLOAD_VERIFY_OK"
+if ! rsync -a --partial -e "$RSYNC_RSH" "$PROC_DIR/.UPLOAD_VERIFY_OK" "$PROC_DIR/.upload_sizes.tsv" "$STORAGE:$DEST/"; then
+  rm -f "$PROC_DIR/.UPLOAD_VERIFY_OK"
+  echo "UPLOAD_VERIFY_SENTINEL_SYNC_FAILED $CAM to $STORAGE:$DEST"
+  exit 61
+fi
 echo "UPLOAD_VERIFY_OK $CAM files=$(wc -l < "$LOCAL_LIST")"
 """.strip()
 
@@ -1516,8 +1584,17 @@ if [[ ! -f "$PROC_DIR/.UPLOAD_VERIFY_OK" ]]; then
   exit 70
 fi
 BYTES=$(du -sb "$PROC_DIR" | awk '{print $1}')
+MARKER="$DIR/${CAM}.PROCESSED_UPLOAD_VERIFIED"
+{
+  echo "SESSION=$SESSION"
+  echo "CAM=$CAM"
+  echo "PROC_DIR=$PROC_DIR"
+  echo "BYTES=$BYTES"
+  echo "VERIFIED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  find "$PROC_DIR" -maxdepth 1 -type f -name '*.VERIFY_OK' -printf 'VERIFY_OK=%f\n' | sort
+} > "$MARKER"
 rm -rf "$PROC_DIR"
-echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES"
+echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES marker=$MARKER"
 """.strip()
 
     def _script_for_step(self, job: PipelineJob, step: str) -> str:
@@ -2377,7 +2454,7 @@ class ProcessingPanel(QtWidgets.QWidget):
                 self,
                 "Delete uploaded session copies?",
                 "This permanently deletes the selected local session folder(s) and camera-host session folder(s) after upload checks.\n\n"
-                "It refuses to continue if .cbrraw files remain.\n\n"
+                "It will delete raw files only when local or uploaded VERIFY_OK evidence exists.\n\n"
                 f"Sessions: {session_text}",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel,
