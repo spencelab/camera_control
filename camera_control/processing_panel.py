@@ -1547,24 +1547,78 @@ if [[ "${{#MP4S[@]}}" != "0" ]]; then
     fi
   done
 fi
-DEST={_q(upload_root)}/$SESSION/$CAM/processed
+CAM_DEST={_q(upload_root)}/$SESSION/$CAM
+DEST="$CAM_DEST/processed"
 ssh "${{SSH_ARGS[@]}}" "$STORAGE" "mkdir -p '$DEST'"
+
+# A fresh upload invalidates any older local upload-verification gate.
+rm -f "$PROC_DIR/.UPLOAD_VERIFY_OK" "$PROC_DIR/.upload_sizes.tsv"
 touch "$PROC_DIR/.UPLOADED"
 rsync -a --partial -e "$RSYNC_RSH" "$PROC_DIR/" "$STORAGE:$DEST/"
-echo "UPLOADED $CAM to $STORAGE:$DEST files=$(find "$PROC_DIR" -maxdepth 1 -type f | wc -l)"
+
+# Acquisition/dump metadata lives beside processed/, not inside it. It is
+# required archive state, so upload every camera-root metadata YAML. The
+# first-frame thumbnail is optional because not every recording produces one.
+mapfile -t ROOT_METADATA < <(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort)
+if [[ "${{#ROOT_METADATA[@]}}" == "0" ]]; then
+  echo "REFUSING_UPLOAD_WITHOUT_ROOT_METADATA $DIR/*.metadata.yaml"
+  exit 51
+fi
+rsync -a --partial -e "$RSYNC_RSH" "${{ROOT_METADATA[@]}}" "$STORAGE:$CAM_DEST/"
+ROOT_THUMB="$DIR/${{CAM}}_first.png"
+if [[ -f "$ROOT_THUMB" ]]; then
+  rsync -a --partial -e "$RSYNC_RSH" "$ROOT_THUMB" "$STORAGE:$CAM_DEST/"
+fi
+
+echo "UPLOADED $CAM to $STORAGE:$CAM_DEST processed_files=$(find "$PROC_DIR" -maxdepth 1 -type f | wc -l) root_metadata=${{#ROOT_METADATA[@]}} thumbnail=$([[ -f "$ROOT_THUMB" ]] && echo yes || echo no)"
 """.strip()
 
     def _script_verify_upload(self, job: PipelineJob) -> str:
         upload_root = self.upload_root
         return self._processed_dir_snippet(job, require_processed=True) + "\n\n" + f"""
 {self._storage_shell_vars()}
-DEST={_q(upload_root)}/$SESSION/$CAM/processed
+CAM_DEST={_q(upload_root)}/$SESSION/$CAM
+DEST="$CAM_DEST/processed"
 LOCAL_LIST=$(mktemp)
 REMOTE_LIST=$(mktemp)
-(cd "$PROC_DIR" && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' -printf '%P\t%s\n' | sort) > "$LOCAL_LIST"
-ssh "${{SSH_ARGS[@]}}" "$STORAGE" "cd '$DEST' && find . -type f ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' -printf '%P\t%s\n' | sort" > "$REMOTE_LIST"
+trap 'rm -f "$LOCAL_LIST" "$REMOTE_LIST"' EXIT
+
+# Verify processed payload plus camera-root scientific sidecars as one archive
+# contract. Prefix processed entries so root files cannot collide by name.
+(
+  cd "$DIR"
+  find "$PROCESSED_SUBDIR" -type f \\
+    ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' \\
+    ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' \\
+    -printf '%P\t%s\n' | sed 's#^#processed/#'
+  find . -maxdepth 1 -type f -name '*.metadata.yaml' -printf '%P\t%s\n'
+  if [[ -f "${{CAM}}_first.png" ]]; then
+    stat -c '%n\t%s' "${{CAM}}_first.png"
+  fi
+) | sort > "$LOCAL_LIST"
+
+if ! grep -qE '^[^/]+\\.metadata\\.yaml[[:space:]]' "$LOCAL_LIST"; then
+  echo "UPLOAD_VERIFY_MISSING_LOCAL_ROOT_METADATA $DIR/*.metadata.yaml"
+  exit 59
+fi
+
+ssh "${{SSH_ARGS[@]}}" "$STORAGE" "
+  set -eo pipefail
+  cd '$CAM_DEST'
+  {{
+    find processed -type f \\
+      ! -name '*.UPLOAD_VERIFY_OK' ! -name '.UPLOAD_VERIFY_OK' \\
+      ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' \\
+      -printf '%P\t%s\n' | sed 's#^#processed/#'
+    find . -maxdepth 1 -type f -name '*.metadata.yaml' -printf '%P\t%s\n'
+    if [[ -f '${{CAM}}_first.png' ]]; then
+      stat -c '%n\t%s' '${{CAM}}_first.png'
+    fi
+  }} | sort
+" > "$REMOTE_LIST"
+
 if ! diff -u "$LOCAL_LIST" "$REMOTE_LIST"; then
-  echo "UPLOAD_SIZE_VERIFY_FAILED $CAM"
+  echo "UPLOAD_SIZE_VERIFY_FAILED $CAM (processed payload and/or root sidecars differ)"
   exit 60
 fi
 cp "$LOCAL_LIST" "$PROC_DIR/.upload_sizes.tsv"
@@ -1574,7 +1628,7 @@ if ! rsync -a --partial -e "$RSYNC_RSH" "$PROC_DIR/.UPLOAD_VERIFY_OK" "$PROC_DIR
   echo "UPLOAD_VERIFY_SENTINEL_SYNC_FAILED $CAM to $STORAGE:$DEST"
   exit 61
 fi
-echo "UPLOAD_VERIFY_OK $CAM files=$(wc -l < "$LOCAL_LIST")"
+echo "UPLOAD_VERIFY_OK $CAM files=$(wc -l < "$LOCAL_LIST") including_root_sidecars=1"
 """.strip()
 
     def _script_delete_uploaded_local(self, job: PipelineJob) -> str:
