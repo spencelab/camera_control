@@ -32,6 +32,10 @@ from .runner import HiitProgress, HiitRunner, HiitState
 
 
 class HiitController(QtCore.QObject):
+    # Emitted (old_state, new_state) on every runner state transition. Additive
+    # observation hook for the Auto-Run automation; unused by the manual HIIT UI.
+    state_changed = QtCore.Signal(object, object)
+
     def __init__(
         self,
         ros: Any,
@@ -77,6 +81,14 @@ class HiitController(QtCore.QObject):
     def _log(self, msg: str) -> None:
         if self._log_fn is not None:
             self._log_fn(msg)
+
+    def loaded_protocol(self):
+        """Public accessor for the last-imported phased regimen (or None).
+
+        Used by the Auto-Run automation to check readiness and read the estimated
+        duration without reaching into private state.
+        """
+        return self._loaded_protocol
 
     def _on_tick(self) -> None:
         if self._runner is not None:
@@ -288,6 +300,11 @@ class HiitController(QtCore.QObject):
             self._release_lock()
             self._finalize_run_log(new)
         self._log(f"HIIT state: {old.value} -> {new.value}")
+        # Notify external observers (Auto-Run automation) after local handling.
+        try:
+            self.state_changed.emit(old, new)
+        except Exception:
+            pass
 
     def _on_progress(self, progress: HiitProgress) -> None:
         self.panel.apply_progress(progress)

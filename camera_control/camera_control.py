@@ -70,6 +70,19 @@ except Exception:
     HiitController = None
     HIIT_AVAILABLE = False
 
+# Optional one-click Auto-Run automation (additive; lives in the automation/
+# subpackage). Same guard pattern: any import problem leaves the GUI unchanged.
+try:
+    from automation.panel import AutoRunPanel
+    from automation.controller import AutoRunController
+    from automation.tts import Speaker
+    AUTORUN_AVAILABLE = True
+except Exception:
+    AutoRunPanel = None
+    AutoRunController = None
+    Speaker = None
+    AUTORUN_AVAILABLE = False
+
 # Optional processing tab. Kept in a separate module so pilot-day data tools do
 # not bloat the main camera cockpit.
 try:
@@ -2735,6 +2748,32 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.hiit_controller = None
                 print(f"WARNING: HIIT trainer disabled: {exc}", file=sys.stderr)
 
+        # Optional one-click Auto-Run automation (additive). Coordinates the
+        # existing camera / metadata / HIIT controls into a single trial loop with
+        # spoken state callouts. Requires the HIIT trainer to be present; absent
+        # entirely (leaving the GUI unchanged) if its package fails to import.
+        self.autorun_panel = None
+        self.autorun_controller = None
+        self.autorun_speaker = None
+        if AUTORUN_AVAILABLE and self.hiit_controller is not None:
+            try:
+                self.autorun_speaker = Speaker(log_fn=self.append_log)
+                self.autorun_controller = AutoRunController(
+                    ros,
+                    self.camera_panel,
+                    self.metadata_panel,
+                    self.treadmill_panel,
+                    self.hiit_controller,
+                    speaker=self.autorun_speaker,
+                    log_fn=self.append_log,
+                )
+                self.autorun_panel = AutoRunPanel(self.autorun_controller)
+            except Exception as exc:  # never let Auto-Run break the cockpit
+                self.autorun_panel = None
+                self.autorun_controller = None
+                self.autorun_speaker = None
+                print(f"WARNING: Auto-Run automation disabled: {exc}", file=sys.stderr)
+
         self.tabs = QtWidgets.QTabWidget()
 
         tab_camera = QtWidgets.QWidget()
@@ -2754,6 +2793,7 @@ class MainWindow(QtWidgets.QMainWindow):
         meta_layout.addWidget(self.metadata_panel)
         meta_layout.addStretch(1)
         tab_meta.setLayout(meta_layout)
+        self._tab_meta = tab_meta
         self.tabs.addTab(tab_meta, "Metadata")
 
         tab_treadmill = QtWidgets.QWidget()
@@ -2778,6 +2818,11 @@ class MainWindow(QtWidgets.QMainWindow):
         preview_layout.addStretch(1)
         tab_preview.setLayout(preview_layout)
         self.tabs.addTab(tab_preview, "Preview")
+
+        # Auto-Run is mounted as the last tab. It refreshes its readiness (loaded
+        # regimen + selected-camera count) each time it is shown.
+        if self.autorun_panel is not None:
+            self.tabs.addTab(self.autorun_panel, "▶ Auto-Run")
 
         self.setCentralWidget(self.tabs)
 
@@ -2955,7 +3000,9 @@ class MainWindow(QtWidgets.QMainWindow):
         QtCore.QTimer.singleShot(0, self.close)
 
     def goto_metadata_tab(self):
-        self.tabs.setCurrentIndex(1)
+        # Resolve dynamically: the Auto-Run tab (when present) shifts fixed indices.
+        idx = self.tabs.indexOf(getattr(self, "_tab_meta", None))
+        self.tabs.setCurrentIndex(idx if idx >= 0 else 1)
 
     def _status_bar_text(self, text: str, max_chars: int = 220) -> str:
         """Keep the bottom status bar from expanding the whole window.
