@@ -1,0 +1,25 @@
+processing:
+  local_sessions_root: "/home/spencelab/camera_sessions"
+  remote_sessions_root: "/home/spencelab/camera_sessions"
+
+  max_parallel_cameras: 5
+
+  cameras:
+    - cam1@local
+
+  conversion:
+    # MP4 playback FPS only. Raw audit acquisition FPS comes from recorded metadata.
+    fps: 25.0
+    r_gain: 1.63
+    g_gain: 1.00
+    b_gain: 1.12
+    gamma: 1.0
+    audit_threshold_frames: 1.5
+
+  upload:
+    host: "spencenquist.dyndns.org"
+    user: "spencelab"
+    port: "44717"
+    root: "/zfsr01/storage/camera_sessions_uploads"
+    verify: "size"
+    max_parallel_uploads: 5
