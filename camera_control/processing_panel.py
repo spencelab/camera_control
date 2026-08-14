@@ -25,7 +25,7 @@ import socket
 import subprocess
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -635,6 +635,8 @@ class PipelineWorker(QtCore.QObject):
 
     def run(self) -> None:
         action_plan = self._expand_action(self.action)
+        safe_eod = self.action == "process_verify_upload_delete_trim"
+        trim_after_delete = self.action in {"process_verify_upload_delete_trim", "delete_uploaded_session_local"}
         jobs = [PipelineJob(session=s, cam=spec.cam, host=spec.host) for s in self.sessions for spec in self.camera_specs]
         per_cam_steps = [
             a for a in action_plan
@@ -649,14 +651,19 @@ class PipelineWorker(QtCore.QObject):
         session_upload_passes = 2 if "upload_session" in action_plan else 0
         session_delete_passes = 1 if "delete_session_local" in action_plan else 0
         force_session_delete_passes = 1 if "delete_session_force_local" in action_plan else 0
+        safe_cleanup_passes = len(self.sessions) * (len(self.camera_specs) + 1) if safe_eod else 0
+        trim_specs = self._unique_trim_specs() if trim_after_delete else []
         total = (
             len(self.sessions)
             * (session_upload_passes + session_delete_passes + force_session_delete_passes + multicam_passes)
             + len(jobs) * len(per_cam_steps)
+            + safe_cleanup_passes
+            + len(trim_specs)
         )
         total = max(1, total)
         done = 0
         ok = 0
+        any_camera_session_deleted = False
 
         self.log.emit(
             f"Processing: action '{self.action}' starting for {len(self.sessions)} sessions x "
@@ -671,10 +678,14 @@ class PipelineWorker(QtCore.QObject):
             session_jobs = [j for j in jobs if j.session == session]
             force_remote_delete_ok = True
             uploaded_camera_cleanup_ok = True
+            safe_eod_chain_ok = True
 
             if "upload_session" in action_plan:
-                if self._upload_session_level_files(session):
+                upload_ok = self._upload_session_level_files(session)
+                if upload_ok:
                     ok += 1
+                elif safe_eod:
+                    safe_eod_chain_ok = False
                 done += 1
                 self.progress.emit(done, total)
 
@@ -686,22 +697,73 @@ class PipelineWorker(QtCore.QObject):
                 done, ok = self._run_camera_step_group(session, session_jobs, step, done, ok, total)
                 attempted = done - done_before
                 succeeded = ok - ok_before
+                step_group_ok = attempted == len(session_jobs) and succeeded == attempted
+                if safe_eod and not step_group_ok:
+                    safe_eod_chain_ok = False
                 if step == "delete_session_force":
-                    force_remote_delete_ok = attempted == len(session_jobs) and succeeded == attempted
+                    force_remote_delete_ok = step_group_ok
                 if step == "delete_camera_session_local":
-                    uploaded_camera_cleanup_ok = attempted == len(session_jobs) and succeeded == attempted
+                    uploaded_camera_cleanup_ok = step_group_ok
+                    if succeeded > 0:
+                        any_camera_session_deleted = True
 
             if (not self._cancelled) and "multicam_sync" in action_plan:
-                if self._run_multicam_sync_audit(session):
+                multicam_ok = self._run_multicam_sync_audit(session)
+                if multicam_ok:
                     ok += 1
+                elif safe_eod:
+                    safe_eod_chain_ok = False
                 done += 1
                 self.progress.emit(done, total)
 
             if (not self._cancelled) and "upload_session" in action_plan:
-                if self._upload_session_level_files(session):
+                upload_ok = self._upload_session_level_files(session)
+                if upload_ok:
                     ok += 1
+                elif safe_eod:
+                    safe_eod_chain_ok = False
                 done += 1
                 self.progress.emit(done, total)
+
+            if safe_eod and not self._cancelled:
+                if safe_eod_chain_ok:
+                    self.status.emit(f"{session}: archive chain passed; deleting verified local copies")
+                    done_before = done
+                    ok_before = ok
+                    done, ok = self._run_camera_step_group(
+                        session, session_jobs, "delete_camera_session_local", done, ok, total
+                    )
+                    attempted = done - done_before
+                    succeeded = ok - ok_before
+                    uploaded_camera_cleanup_ok = attempted == len(session_jobs) and succeeded == attempted
+                    if succeeded > 0:
+                        any_camera_session_deleted = True
+
+                    if uploaded_camera_cleanup_ok:
+                        if self._delete_local_session_tree(session):
+                            ok += 1
+                    else:
+                        msg = (
+                            "KEEPING_TMILL_SESSION_CAMERA_CLEANUP_FAILED "
+                            "one or more camera-host session folders were not deleted"
+                        )
+                        self.log.emit(f"Processing: {session}/tmill: delete_session_local FAIL: {msg}")
+                        self.status.emit(f"{session}: camera cleanup failed; tmill copy kept so cleanup can be retried")
+                        self._append_manifest(session, "tmill", "delete_session_local", False, msg)
+                    done += 1
+                    self.progress.emit(done, total)
+                else:
+                    msg = (
+                        "SAFE_EOD_DELETE_SKIPPED prior process/verify/upload/multicam step failed; "
+                        "no local session data deleted"
+                    )
+                    self.log.emit(f"Processing: {session}: {msg}")
+                    self.status.emit(f"{session}: verification chain failed; local data kept")
+                    for _ in session_jobs:
+                        done += 1
+                        self.progress.emit(done, total)
+                    done += 1
+                    self.progress.emit(done, total)
 
             if (not self._cancelled) and "delete_session_local" in action_plan:
                 if "delete_camera_session_local" in action_plan and not uploaded_camera_cleanup_ok:
@@ -732,10 +794,148 @@ class PipelineWorker(QtCore.QObject):
                 done += 1
                 self.progress.emit(done, total)
 
+        if trim_after_delete and not self._cancelled:
+            done, ok = self._run_trim_group(
+                trim_specs,
+                any_camera_session_deleted=any_camera_session_deleted,
+                done=done,
+                ok=ok,
+                total=total,
+            )
+
         if self._cancelled:
             self.log.emit(f"Processing: action '{self.action}' cancelled")
         self.log.emit(f"Processing: action '{self.action}' complete: {ok}/{done} step(s) OK")
         self.finished.emit(self.action, ok, done)
+
+    def _unique_trim_specs(self) -> List[CameraSpec]:
+        """Return one representative camera per unique host for post-delete TRIM."""
+        out: List[CameraSpec] = []
+        seen: set[str] = set()
+        for spec in self.camera_specs:
+            key = str(spec.host or "").strip().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(spec)
+        return out
+
+    def _trim_camera_host(self, spec: CameraSpec) -> bool:
+        """Best-effort batch TRIM of the filesystem holding camera_sessions.
+
+        This runs only after verified local camera-session deletion. It never
+        participates in the archive/deletion safety gate. The sudo call is
+        non-interactive by design, so a host without a narrowly configured
+        NOPASSWD fstrim rule fails visibly instead of hanging the GUI.
+        """
+        root = self.remote_sessions_root
+        script = f"""
+set -eo pipefail
+ROOT={_q(root)}
+if ! command -v findmnt >/dev/null 2>&1; then
+  echo "TRIM_FAILED host={spec.host} reason=findmnt_not_found"
+  exit 90
+fi
+if ! command -v fstrim >/dev/null 2>&1; then
+  echo "TRIM_FAILED host={spec.host} reason=fstrim_not_found"
+  exit 91
+fi
+MOUNT=$(findmnt -n -o TARGET -T "$ROOT" | head -n 1)
+if [[ -z "$MOUNT" ]]; then
+  echo "TRIM_FAILED host={spec.host} reason=could_not_resolve_mount root=$ROOT"
+  exit 92
+fi
+echo "TRIM_START host={spec.host} mount=$MOUNT root=$ROOT"
+if OUTPUT=$(sudo -n fstrim -v "$MOUNT" 2>&1); then
+  echo "$OUTPUT"
+  echo "TRIM_OK host={spec.host} mount=$MOUNT"
+else
+  RC=$?
+  echo "$OUTPUT"
+  echo "TRIM_FAILED host={spec.host} mount=$MOUNT rc=$RC note=archive_delete_already_complete"
+  exit "$RC"
+fi
+""".strip()
+        self.log.emit(f"Processing: {spec.host}: trimming filesystem containing {root}")
+        try:
+            proc = self._ssh_streaming(spec.host, script, label=f"{spec.host} fstrim")
+        except subprocess.TimeoutExpired:
+            self.log.emit(
+                f"Processing: {spec.host}: TRIM_FAILED timeout; archive/delete results are unaffected"
+            )
+            return False
+        out = proc.stdout or ""
+        if proc.returncode == 0:
+            self.log.emit(f"Processing: {spec.host}: TRIM OK: {_tail(out, 4)}")
+            return True
+        self.log.emit(
+            f"Processing: {spec.host}: TRIM FAILED rc={proc.returncode}: {_tail(out, 8)} "
+            "(archive/delete results are unaffected)"
+        )
+        return False
+
+    def _run_trim_group(
+        self,
+        specs: List[CameraSpec],
+        *,
+        any_camera_session_deleted: bool,
+        done: int,
+        ok: int,
+        total: int,
+    ) -> tuple[int, int]:
+        """Run one post-delete fstrim per unique camera host, in parallel.
+
+        TRIM remains maintenance only: failure never changes whether verified
+        archive deletion was allowed. Waiting for the parallel group gives the
+        GUI and persistent receipt a definitive result for every host.
+        """
+        if not specs:
+            return done, ok
+
+        if not any_camera_session_deleted:
+            for spec in specs:
+                self.log.emit(
+                    f"Processing: {spec.host}: TRIM_SKIPPED no camera session was deleted during this action"
+                )
+                done += 1
+                self.progress.emit(done, total)
+            return done, ok
+
+        max_workers = max(1, min(len(specs), self.max_parallel_cameras))
+        self.status.emit(f"TRIM: launching {len(specs)} camera host(s), parallel={max_workers}")
+        self.log.emit(f"Processing: TRIM launching {len(specs)} camera host(s), parallel={max_workers}")
+
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="processing_fstrim",
+        )
+        futures: Dict[concurrent.futures.Future[bool], CameraSpec] = {}
+        try:
+            for spec in specs:
+                if self._cancelled:
+                    break
+                futures[executor.submit(self._trim_camera_host, spec)] = spec
+
+            for future in concurrent.futures.as_completed(futures):
+                spec = futures[future]
+                try:
+                    trim_ok = bool(future.result())
+                except Exception as exc:
+                    trim_ok = False
+                    self.log.emit(
+                        f"Processing: {spec.host}: TRIM_FAILED exception={exc} "
+                        "note=archive_delete_already_complete"
+                    )
+                if trim_ok:
+                    ok += 1
+                done += 1
+                self.progress.emit(done, total)
+                if self._cancelled:
+                    break
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        return done, ok
 
     def _parallel_limit_for_step(self, step: str) -> int:
         if step in ("upload", "verify_upload"):
@@ -833,6 +1033,10 @@ class PipelineWorker(QtCore.QObject):
         if action == "upload_verify":
             return ["upload_session", "upload", "verify_upload"]
         if action == "process_verify_upload":
+            return ["process", "verify", "upload_session", "upload", "verify_upload", "multicam_sync"]
+        if action == "process_verify_upload_delete_trim":
+            # Cleanup and TRIM are intentionally handled as post-verification
+            # phases in run(), after the final session-level upload pass.
             return ["process", "verify", "upload_session", "upload", "verify_upload", "multicam_sync"]
         return [action]
 
@@ -2079,6 +2283,11 @@ class ProcessingPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self._thread: Optional[QtCore.QThread] = None
         self._worker: Optional[QtCore.QObject] = None
+        self._persistent_pipeline_log_path: Optional[Path] = None
+        self._last_eod_log_path: Optional[Path] = None
+        self._persistent_pipeline_log_write_failed = False
+        self._last_progress_done = 0
+        self._last_progress_total = 0
         self.settings = QtCore.QSettings("SpenceLab", "camera_control")
         self.processing_config_path = _remembered_processing_config_path()
         cfg = _load_processing_config(self.processing_config_path).get("processing", {})
@@ -2132,7 +2341,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.upload_btn = QtWidgets.QPushButton("Upload processed")
         self.verify_upload_btn = QtWidgets.QPushButton("Verify upload")
         self.delete_uploaded_local_btn = QtWidgets.QPushButton("Delete local uploaded files")
-        self.delete_uploaded_session_local_btn = QtWidgets.QPushButton("Delete uploaded session copies")
+        self.delete_uploaded_session_local_btn = QtWidgets.QPushButton("Delete uploaded session copies + trim")
         self.delete_sessions_btn = QtWidgets.QPushButton("DELETE SELECTED SESSIONS")
         self.delete_sessions_btn.setToolTip(
             "Permanently delete selected session folders from tmill and all configured camera hosts. "
@@ -2145,6 +2354,14 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.process_verify_btn = QtWidgets.QPushButton("Process + verify")
         self.upload_verify_btn = QtWidgets.QPushButton("Upload + verify")
         self.process_to_upload_btn = QtWidgets.QPushButton("Process + verify + upload")
+        self.end_of_day_btn = QtWidgets.QPushButton("END OF DAY: process + upload + delete + trim")
+        self.end_of_day_btn.setToolTip(
+            "Process, verify, upload, verify upload, run multi-camera sync audit, then delete only sessions "
+            "whose entire verification chain passed. Finally run one batch TRIM per camera host."
+        )
+        self.end_of_day_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; padding: 6px 10px; }"
+        )
         self.cancel_btn = QtWidgets.QPushButton("Cancel")
         self.cancel_btn.setEnabled(False)
 
@@ -2186,6 +2403,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.process_verify_btn.clicked.connect(lambda: self.run_pipeline("process_verify"))
         self.upload_verify_btn.clicked.connect(lambda: self.run_pipeline("upload_verify"))
         self.process_to_upload_btn.clicked.connect(lambda: self.run_pipeline("process_verify_upload"))
+        self.end_of_day_btn.clicked.connect(lambda: self.run_pipeline("process_verify_upload_delete_trim"))
         self.cancel_btn.clicked.connect(self.cancel)
         QtCore.QTimer.singleShot(0, self.refresh_sessions)
 
@@ -2264,6 +2482,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         buttons3.addWidget(self.process_verify_btn)
         buttons3.addWidget(self.upload_verify_btn)
         buttons3.addWidget(self.process_to_upload_btn)
+        buttons3.addWidget(self.end_of_day_btn)
         buttons3.addWidget(self.cancel_btn)
         buttons3.addStretch(1)
 
@@ -2275,7 +2494,10 @@ class ProcessingPanel(QtWidgets.QWidget):
             "Run raw info/audit writes non-destructive diagnostics into each camera processed/ folder. "
             "Process and Process + verify paths also safely attempt the session-level multi-camera sync audit. "
             "Normal cleanup buttons require prior VERIFY_OK / UPLOAD_VERIFY_OK sentinel files. "
-            "Delete uploaded session copies removes selected local session folders after upload verification and refuses if raw binaries remain. "
+            "END OF DAY runs the full process/verify/upload/multi-cam chain and only then attempts deletion for sessions whose entire chain passed; "
+            "the existing deletion sentinels are still re-checked, and camera-drive TRIM is a final best-effort maintenance step. "
+            "Delete uploaded session copies + trim removes selected local session folders after upload verification, refuses if raw binaries remain, "
+            "then runs one best-effort batch TRIM per camera host. "
             "DELETE SELECTED SESSIONS is intentionally destructive for disposable tests: after a prominent confirmation it deletes the "
             "selected session from tmill and every configured camera host without requiring processing/upload sentinels; storage is untouched."
         )
@@ -2408,7 +2630,7 @@ class ProcessingPanel(QtWidgets.QWidget):
             self.audit_btn, self.info_audit_btn, self.multicam_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
             self.delete_uploaded_local_btn, self.delete_uploaded_session_local_btn, self.delete_sessions_btn,
-            self.process_verify_btn, self.upload_verify_btn, self.process_to_upload_btn,
+            self.process_verify_btn, self.upload_verify_btn, self.process_to_upload_btn, self.end_of_day_btn,
         ]:
             widget.setEnabled(not busy)
         self.cancel_btn.setEnabled(busy)
@@ -2430,6 +2652,117 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     def _selected_sessions(self) -> List[str]:
         return [item.text() for item in self.session_list.selectedItems()]
+
+    def _end_of_day_log_dir(self) -> Path:
+        """Persistent tmill receipts live outside camera_sessions so cleanup cannot remove them."""
+        return Path.home() / "camera_control_logs" / "end_of_day"
+
+    def _begin_end_of_day_log(self, action: str, sessions: List[str], cameras: List[str]) -> Path:
+        """Create a durable tmill receipt before either verified cleanup path starts.
+
+        Failure here is intentionally fatal: if camera-control is going to delete
+        verified local copies, tmill must first be able to create its tiny
+        persistent audit trail.
+        """
+        log_dir = self._end_of_day_log_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+
+        started = datetime.now(timezone.utc)
+        stamp = started.strftime("%Y%m%dT%H%M%SZ")
+        if action == "delete_uploaded_session_local":
+            slug = "delete_uploaded_session_copies_trim"
+            title = "# SpenceLab camera-control manual verified cleanup + trim receipt"
+        else:
+            slug = "process_verify_upload_delete_trim"
+            title = "# SpenceLab camera-control end-of-day archive/cleanup receipt"
+        path = log_dir / f"{stamp}_{slug}.log"
+        if path.exists():
+            path = log_dir / f"{stamp}_{os.getpid()}_{slug}.log"
+
+        upload_user = self.upload_user_edit.text().strip() or "spencelab"
+        upload_host = self.upload_host_edit.text().strip() or "gpu2"
+        upload_port = self.upload_port_edit.text().strip()
+        upload_root = self.upload_root_edit.text().strip()
+        upload_target = f"{upload_user}@{upload_host}:{upload_root}"
+        if upload_port:
+            upload_target += f" (ssh_port={upload_port})"
+
+        lines = [
+            title,
+            f"START_UTC={started.isoformat(timespec='seconds')}",
+            f"ACTION={action}",
+            f"HOST={socket.gethostname()}",
+            f"PID={os.getpid()}",
+            f"PROCESSING_PROFILE={self.processing_config_path}",
+            f"LOCAL_SESSIONS_ROOT={self._base_dir()}",
+            f"REMOTE_CAMERA_SESSIONS_ROOT={self.remote_root_edit.text().strip() or '/home/spencelab/camera_sessions'}",
+            f"UPLOAD_TARGET={upload_target}",
+            f"SESSION_COUNT={len(sessions)}",
+            f"CAMERA_COUNT={len(cameras)}",
+            f"CAMERAS={' '.join(cameras)}",
+        ]
+        lines.extend(f"SESSION_{index:03d}={session}" for index, session in enumerate(sessions, start=1))
+        lines.extend(["", "----- BEGIN PIPELINE LOG -----"])
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        self._persistent_pipeline_log_path = path
+        self._last_eod_log_path = path
+        self._persistent_pipeline_log_write_failed = False
+        return path
+
+    def _append_end_of_day_log(self, text: str, *, tag: str = "LOG") -> None:
+        path = self._persistent_pipeline_log_path
+        if path is None or self._persistent_pipeline_log_write_failed:
+            return
+        try:
+            now = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+            message_lines = str(text).splitlines() or [""]
+            with path.open("a", encoding="utf-8") as handle:
+                for line in message_lines:
+                    handle.write(f"{now}\t{tag}\t{line}\n")
+        except Exception as exc:
+            self._persistent_pipeline_log_write_failed = True
+            # Do not disturb a pipeline that is already safely running merely
+            # because later receipt appends failed. The initial receipt creation
+            # is the hard preflight gate; subsequent failure is surfaced loudly.
+            self.log_line.emit(f"Processing: END_OF_DAY_LOG_WRITE_FAILED path={path}: {exc}")
+
+    @QtCore.Slot(str)
+    def _handle_worker_log(self, text: str) -> None:
+        self.log_line.emit(text)
+        self._append_end_of_day_log(text)
+
+    @QtCore.Slot(str)
+    def _handle_worker_status(self, text: str) -> None:
+        self._set_status_text(text)
+        self._append_end_of_day_log(text, tag="STATUS")
+
+    def _finish_end_of_day_log(self, ok: int, done: int) -> Optional[Path]:
+        path = self._persistent_pipeline_log_path
+        if path is None:
+            return self._last_eod_log_path
+
+        total = max(done, self._last_progress_total)
+        success = ok == done == total and not self._persistent_pipeline_log_write_failed
+        ended = datetime.now(timezone.utc)
+        footer = [
+            "----- END PIPELINE LOG -----",
+            f"END_UTC={ended.isoformat(timespec='seconds')}",
+            f"RESULT={'SUCCESS' if success else 'INCOMPLETE'}",
+            f"STEPS_OK={ok}",
+            f"STEPS_COMPLETED={done}",
+            f"STEPS_TOTAL={total}",
+            f"RECEIPT_LOG_WRITE_OK={0 if self._persistent_pipeline_log_write_failed else 1}",
+            f"LOG_PATH={path}",
+        ]
+        try:
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write("\n" + "\n".join(footer) + "\n")
+        except Exception as exc:
+            self.log_line.emit(f"Processing: END_OF_DAY_LOG_FINALIZE_FAILED path={path}: {exc}")
+        finally:
+            self._persistent_pipeline_log_path = None
+        return path
 
     @QtCore.Slot()
     def create_thumbnails(self) -> None:
@@ -2475,6 +2808,41 @@ class ProcessingPanel(QtWidgets.QWidget):
             self.status_label.setText("No camera hosts/nodes configured.")
             return
 
+        if action == "process_verify_upload_delete_trim":
+            session_text = ", ".join(sessions[:5])
+            if len(sessions) > 5:
+                session_text += f", ... ({len(sessions)} total)"
+            reply = QtWidgets.QMessageBox.warning(
+                self,
+                "End-of-day archive and cleanup?",
+                "This runs PROCESS + VERIFY + UPLOAD + VERIFY UPLOAD + MULTI-CAMERA AUDIT.\n\n"
+                "A selected session is deleted from tmill and the configured camera hosts ONLY if every step "
+                "in that session's current run succeeds, and the existing upload/deletion sentinels pass again.\n\n"
+                "After successful camera cleanup, one batch TRIM is attempted on each camera host. "
+                "TRIM failure does not affect the archive or deletion result.\n\n"
+                f"Sessions: {session_text}",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                self.status_label.setText("End-of-day archive/cleanup cancelled. Nothing was started.")
+                return
+
+            try:
+                receipt_path = self._begin_end_of_day_log(action, sessions, cameras)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Cannot create end-of-day receipt",
+                    "Nothing was started because camera-control could not create the persistent tmill "
+                    "end-of-day log.\n\n"
+                    f"{exc}",
+                )
+                self.status_label.setText("End-of-day archive/cleanup not started: receipt log could not be created.")
+                return
+            self.log_line.emit(f"Processing: end-of-day receipt log: {receipt_path}")
+            self._append_end_of_day_log(f"RECEIPT_READY path={receipt_path}", tag="CONTROL")
+
         if action == "delete_sessions":
             session_lines = "<br>".join(f"• {s}" for s in sessions)
             box = QtWidgets.QMessageBox(self)
@@ -2506,9 +2874,10 @@ class ProcessingPanel(QtWidgets.QWidget):
                 session_text += f", ... ({len(sessions)} total)"
             reply = QtWidgets.QMessageBox.warning(
                 self,
-                "Delete uploaded session copies?",
+                "Delete uploaded session copies + trim?",
                 "This permanently deletes the selected local session folder(s) and camera-host session folder(s) after upload checks.\n\n"
-                "It will delete raw files only when local or uploaded VERIFY_OK evidence exists.\n\n"
+                "It will delete raw files only when local or uploaded VERIFY_OK evidence exists. After successful camera cleanup, "
+                "one batch TRIM is attempted on each camera host. TRIM failure does not affect the archive or deletion result.\n\n"
                 f"Sessions: {session_text}",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -2517,7 +2886,24 @@ class ProcessingPanel(QtWidgets.QWidget):
                 self.status_label.setText("Session cleanup cancelled.")
                 return
 
-        self.progress.setRange(0, max(1, len(sessions) * len(cameras)))
+            try:
+                receipt_path = self._begin_end_of_day_log(action, sessions, cameras)
+            except Exception as exc:
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Cannot create cleanup receipt",
+                    "Nothing was started because camera-control could not create the persistent tmill "
+                    "manual-cleanup log.\n\n"
+                    f"{exc}",
+                )
+                self.status_label.setText("Manual cleanup not started: receipt log could not be created.")
+                return
+            self.log_line.emit(f"Processing: manual cleanup receipt log: {receipt_path}")
+            self._append_end_of_day_log(f"RECEIPT_READY path={receipt_path}", tag="CONTROL")
+
+        self._last_progress_done = 0
+        self._last_progress_total = max(1, len(sessions) * len(cameras))
+        self.progress.setRange(0, self._last_progress_total)
         self.progress.setValue(0)
         self.status_label.setText(f"Running {action} for {len(sessions)} sessions x {len(cameras)} cameras...")
         self._set_busy(True)
@@ -2564,9 +2950,9 @@ class ProcessingPanel(QtWidgets.QWidget):
     def _start_worker(self, worker: QtCore.QObject, start_slot, finished_signal, finished_slot) -> None:
         worker.moveToThread(self._thread)
         self._thread.started.connect(start_slot)
-        worker.log.connect(self.log_line.emit)  # type: ignore[attr-defined]
+        worker.log.connect(self._handle_worker_log)  # type: ignore[attr-defined]
         if hasattr(worker, "status"):
-            worker.status.connect(self._set_status_text)  # type: ignore[attr-defined]
+            worker.status.connect(self._handle_worker_status)  # type: ignore[attr-defined]
         worker.progress.connect(self._on_progress)  # type: ignore[attr-defined]
         finished_signal.connect(finished_slot)
         # The worker lives in the QThread. Do not drop the last Python
@@ -2597,7 +2983,9 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(int, int)
     def _on_progress(self, done: int, total: int) -> None:
-        self.progress.setRange(0, max(1, total))
+        self._last_progress_done = int(done)
+        self._last_progress_total = max(1, int(total))
+        self.progress.setRange(0, self._last_progress_total)
         self.progress.setValue(done)
         self.status_label.setText(f"Processing jobs: {done}/{total}")
 
@@ -2607,8 +2995,51 @@ class ProcessingPanel(QtWidgets.QWidget):
 
     @QtCore.Slot(str, int, int)
     def _on_pipeline_finished(self, action: str, ok: int, done: int) -> None:
-        status_text = f"Done: {action}: {ok}/{done} step(s) OK."
-        if action in {"multicam_sync", "process", "info_audit", "process_verify", "process_verify_upload"}:
+        receipt_path: Optional[Path] = None
+        if action in {"process_verify_upload_delete_trim", "delete_uploaded_session_local"}:
+            total = max(done, self._last_progress_total)
+            archive_complete = ok == done == total
+            receipt_write_ok = not self._persistent_pipeline_log_write_failed
+            receipt_path = self._finish_end_of_day_log(ok, done)
+            if action == "delete_uploaded_session_local":
+                if archive_complete and receipt_write_ok:
+                    status_text = (
+                        "Manual verified cleanup complete: local session copies deleted, camera-drive TRIM completed, "
+                        "and the persistent tmill receipt was saved."
+                    )
+                elif archive_complete:
+                    status_text = (
+                        "Manual verified cleanup completed, but persistent receipt logging encountered an error. "
+                        "The archive/delete result is unaffected; see the GUI log."
+                    )
+                else:
+                    status_text = (
+                        f"Manual verified cleanup finished with safeguards active: {ok}/{done} completed step(s) OK "
+                        f"out of {total} planned. Any failed deletion gate kept its affected local copy; "
+                        "a TRIM-only failure is non-destructive. See the log."
+                    )
+            elif archive_complete and receipt_write_ok:
+                status_text = (
+                    "END OF DAY complete: archive verified, local session copies deleted, "
+                    "camera-drive TRIM completed, and the persistent tmill receipt was saved."
+                )
+            elif archive_complete:
+                status_text = (
+                    "END OF DAY archive/cleanup completed, but persistent receipt logging encountered an error. "
+                    "The archive/delete result is unaffected; see the GUI log."
+                )
+            else:
+                status_text = (
+                    f"END OF DAY finished with safeguards active: {ok}/{done} completed step(s) OK "
+                    f"out of {total} planned. Any session whose verification chain failed was kept; "
+                    "see the log. A TRIM failure is non-destructive."
+                )
+        else:
+            status_text = f"Done: {action}: {ok}/{done} step(s) OK."
+        if action in {
+            "multicam_sync", "process", "info_audit", "process_verify", "process_verify_upload",
+            "process_verify_upload_delete_trim",
+        }:
             sync_statuses: List[str] = []
             sync_headlines: List[str] = []
             for session in self._selected_sessions():
@@ -2627,6 +3058,10 @@ class ProcessingPanel(QtWidgets.QWidget):
             elif sync_statuses:
                 counts = {name: sync_statuses.count(name) for name in sorted(set(sync_statuses))}
                 status_text += " Multi-cam: " + ", ".join(f"{key}={value}" for key, value in counts.items()) + "."
+        if receipt_path is not None:
+            status_text += f" Receipt: {receipt_path}."
+            receipt_label = "MANUAL_CLEANUP_LOG_SAVED" if action == "delete_uploaded_session_local" else "END_OF_DAY_LOG_SAVED"
+            self.log_line.emit(f"Processing: {receipt_label} {receipt_path}")
         self._set_status_text(status_text)
-        if action in {"delete_uploaded_session_local", "delete_sessions"}:
+        if action in {"delete_uploaded_session_local", "delete_sessions", "process_verify_upload_delete_trim"}:
             QtCore.QTimer.singleShot(0, self.refresh_sessions)
