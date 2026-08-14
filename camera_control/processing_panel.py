@@ -1958,6 +1958,172 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES marker=$MARKER"
         self.status.emit(f"{session}: {result.headline}: {errors}")
         return False
 
+    def _archive_camera_inventory_script(self, directory: str, cam: str) -> str:
+        """Return shell that lists archive-relevant camera files as path/size/fingerprint.
+
+        Upload bookkeeping sentinels are deliberately ignored. Root metadata gets
+        a SHA-256 fingerprint because rolling recordings may reuse the same metadata
+        filename even when they are different acquisitions. Large processed payloads
+        use path + byte size; their run/dump identifiers normally make paths unique.
+        """
+        return f"""
+set -eo pipefail
+DIR={_q(directory)}
+CAM={_q(cam)}
+PROCESSED_SUBDIR={_q(self.processed_subdir)}
+if [[ ! -d "$DIR" ]]; then
+  exit 0
+fi
+cd "$DIR"
+
+if [[ -d "$PROCESSED_SUBDIR" ]]; then
+  while IFS= read -r -d '' path; do
+    printf '%s\t%s\t-\n' "$path" "$(stat -c %s "$path")"
+  done < <(
+    find "$PROCESSED_SUBDIR" -type f \
+      ! -name '.UPLOAD_VERIFY_OK' ! -name '*.UPLOAD_VERIFY_OK' \
+      ! -name '.upload_sizes.tsv' ! -name '*.upload_sizes.tsv' \
+      ! -name '.UPLOADED' -print0 | sort -z
+  )
+fi
+
+while IFS= read -r -d '' path; do
+  rel="${{path#./}}"
+  printf '%s\t%s\t%s\n' "$rel" "$(stat -c %s "$path")" "$(sha256sum "$path" | awk '{{print $1}}')"
+done < <(find . -maxdepth 1 -type f -name '*.metadata.yaml' -print0 | sort -z)
+
+if [[ -f "${{CAM}}_first.png" ]]; then
+  printf '%s\t%s\t-\n' "${{CAM}}_first.png" "$(stat -c %s "${{CAM}}_first.png")"
+fi
+""".strip()
+
+    @staticmethod
+    def _parse_archive_camera_inventory(text: str) -> Dict[str, tuple[int, str]]:
+        inventory: Dict[str, tuple[int, str]] = {}
+        for line in (text or "").splitlines():
+            if not line.strip():
+                continue
+            parts = line.split("\t", 2)
+            if len(parts) != 3:
+                raise ValueError(f"malformed inventory line: {line!r}")
+            rel, size_text, fingerprint = parts
+            inventory[rel.lstrip("./")] = (int(size_text), fingerprint)
+        return inventory
+
+    def _check_remote_session_collision(self, session: str) -> tuple[bool, str]:
+        """Fail closed if storage already contains incompatible camera payload.
+
+        This runs before *any* session-level rsync so a reused session identity cannot
+        overwrite session.yaml/rosbag bookkeeping before we notice stale camera data.
+        Existing storage is allowed when it is an exact subset of the current local
+        camera archive, which preserves safe retries after interrupted uploads.
+        """
+        storage = self._storage_spec()
+        remote_session = f"{self.upload_root}/{session}"
+        expected_cams = {spec.cam for spec in self.camera_specs}
+
+        list_camera_dirs = (
+            f"if [[ -d {_q(remote_session)} ]]; then "
+            f"find {_q(remote_session)} -mindepth 1 -maxdepth 1 -type d "
+            f"-name 'cam*' -printf '%f\n' | sort; fi"
+        )
+        try:
+            remote_dirs_proc = self._run_local(
+                ["ssh"] + self._storage_ssh_argv() + [storage, list_camera_dirs],
+                timeout_s=120,
+            )
+        except Exception as exc:
+            return False, f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} storage_camera_dir_check={exc}"
+        if remote_dirs_proc.returncode != 0:
+            return False, (
+                f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} storage_camera_dir_check="
+                f"{_tail(remote_dirs_proc.stdout, 6)}"
+            )
+
+        remote_cam_dirs = {line.strip() for line in (remote_dirs_proc.stdout or "").splitlines() if line.strip()}
+        unexpected_dirs = sorted(remote_cam_dirs - expected_cams)
+        if unexpected_dirs:
+            return False, (
+                f"REMOTE_SESSION_COLLISION session={session} remote_only_camera_dirs={unexpected_dirs}; "
+                "choose a new session/trial identity"
+            )
+
+        for spec in self.camera_specs:
+            local_camera_dir = f"{self.remote_sessions_root}/{session}/{spec.cam}"
+            remote_camera_dir = f"{remote_session}/{spec.cam}"
+
+            try:
+                local_proc = self._ssh(
+                    spec.host,
+                    self._archive_camera_inventory_script(local_camera_dir, spec.cam),
+                    timeout_s=120,
+                )
+            except Exception as exc:
+                return False, (
+                    f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} cam={spec.cam} "
+                    f"local_inventory={exc}"
+                )
+            if local_proc.returncode != 0:
+                return False, (
+                    f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} cam={spec.cam} "
+                    f"local_inventory={_tail(local_proc.stdout, 6)}"
+                )
+
+            remote_script = self._archive_camera_inventory_script(remote_camera_dir, spec.cam)
+            try:
+                remote_proc = self._run_local(
+                    ["ssh"] + self._storage_ssh_argv() + [storage, remote_script],
+                    timeout_s=120,
+                )
+            except Exception as exc:
+                return False, (
+                    f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} cam={spec.cam} "
+                    f"storage_inventory={exc}"
+                )
+            if remote_proc.returncode != 0:
+                return False, (
+                    f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} cam={spec.cam} "
+                    f"storage_inventory={_tail(remote_proc.stdout, 6)}"
+                )
+
+            try:
+                local_inv = self._parse_archive_camera_inventory(local_proc.stdout or "")
+                remote_inv = self._parse_archive_camera_inventory(remote_proc.stdout or "")
+            except Exception as exc:
+                return False, (
+                    f"REMOTE_SESSION_PREFLIGHT_FAILED session={session} cam={spec.cam} "
+                    f"inventory_parse={exc}"
+                )
+
+            conflicts: List[str] = []
+            for rel, (remote_size, remote_fingerprint) in sorted(remote_inv.items()):
+                local_entry = local_inv.get(rel)
+                if local_entry is None:
+                    conflicts.append(f"remote-only:{rel}")
+                    continue
+                local_size, local_fingerprint = local_entry
+                if local_size != remote_size:
+                    conflicts.append(f"size:{rel}:{remote_size}!={local_size}")
+                    continue
+                if (
+                    remote_fingerprint != "-"
+                    and local_fingerprint != "-"
+                    and remote_fingerprint != local_fingerprint
+                ):
+                    conflicts.append(f"metadata-content:{rel}")
+
+            if conflicts:
+                preview = conflicts[:8]
+                extra_count = max(0, len(conflicts) - len(preview))
+                suffix = f" (+{extra_count} more)" if extra_count else ""
+                return False, (
+                    f"REMOTE_SESSION_COLLISION session={session} cam={spec.cam} "
+                    f"conflicts={preview}{suffix}; storage already contains camera payload "
+                    "not represented by this local acquisition; choose a new session/trial identity"
+                )
+
+        return True, f"REMOTE_SESSION_PREFLIGHT_OK session={session}"
+
     def _upload_session_level_files(self, session: str) -> bool:
         local_dir = self.base_dir / session
         if not local_dir.is_dir():
@@ -1972,6 +2138,14 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES marker=$MARKER"
             self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {msg}")
             self._append_manifest(session, "tmill", "upload_session", False, msg)
             return False
+
+        collision_ok, collision_msg = self._check_remote_session_collision(session)
+        if not collision_ok:
+            self.log.emit(f"Processing: {session}/tmill: upload_session FAIL: {collision_msg}")
+            self.status.emit(f"{session}: remote archive collision; local data kept")
+            self._append_manifest(session, "tmill", "upload_session", False, collision_msg)
+            return False
+        self.log.emit(f"Processing: {session}/tmill: {collision_msg}")
 
         # Invalidate any older verification before attempting a fresh upload.
         # A failed or interrupted upload must leave local deletion blocked.
