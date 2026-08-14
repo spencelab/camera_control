@@ -342,7 +342,7 @@ class SessionMetadata:
     speed_cm_s: str = ""
     condition: str = ""
     notes: str = ""
-    circular_trigger_type: str = "mid"
+    circular_trigger_type: str = "end"
     pre_trigger_s: str = ""
     post_trigger_s: str = ""
 
@@ -410,6 +410,7 @@ class CameraControlRos(Node):
         self._start_clients: Dict[str, Any] = {}
         self._stop_clients: Dict[str, Any] = {}
         self._dump_clients: Dict[str, Any] = {}
+        self._triggerbox_clients: Dict[str, Any] = {}
         self._event_subs: Dict[str, Any] = {}
         self._treadmill_clients: Dict[str, Any] = {}
         self._treadmill_status_sub = None
@@ -533,6 +534,19 @@ class CameraControlRos(Node):
         req.output_prefix = str(output_prefix or "")
         return cli.call_async(req)
 
+    def triggerbox_output_async(self, enabled: bool):
+        """Enable/blank the shared physical trigger output without stopping Timer1."""
+        service = "/triggerbox_host/enable_output" if enabled else "/triggerbox_host/disable_output"
+        key = "enable_output" if enabled else "disable_output"
+        if key not in self._triggerbox_clients:
+            self._triggerbox_clients[key] = self.create_client(Trigger, service)
+        cli = self._triggerbox_clients[key]
+        if not cli.service_is_ready():
+            cli.wait_for_service(timeout_sec=0.0)
+        if not cli.service_is_ready():
+            raise RuntimeError(f"triggerbox service is not ready: {service}")
+        return cli.call_async(Trigger.Request())
+
     # ---- treadmill_control client helpers ----
     def treadmill_available(self) -> bool:
         return bool(TREADMILL_CONTROL_AVAILABLE)
@@ -618,7 +632,9 @@ class MetadataPanel(QtWidgets.QGroupBox):
 
         self.trigger_type = QtWidgets.QComboBox()
         self.trigger_type.addItems(["start", "mid", "end"])
-        self.trigger_type.setCurrentText("mid")
+        # End-trigger is the safest/default RAM-buffer behavior: pressing D keeps
+        # the immediately preceding window, with one shared hardware stop edge.
+        self.trigger_type.setCurrentText("end")
         self.pre_trigger_s = QtWidgets.QLineEdit()
         self.post_trigger_s = QtWidgets.QLineEdit()
 
@@ -1304,6 +1320,18 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._pending_apply_batches: Dict[int, Dict[str, Any]] = {}
         self._stop_batch_counter = 0
         self._pending_stop_batches: Dict[int, Dict[str, Any]] = {}
+        self._dump_batch_counter = 0
+        self._active_dump_batch: Optional[Dict[str, Any]] = None
+
+        # Continuous-recording visibility/reminder.  RAM-buffer mode is often
+        # intentionally left armed for long periods, so the long-recording alarm
+        # is enabled only for rolling recordings.
+        self._recording_alert_started_monotonic: Optional[float] = None
+        self._recording_alert_blink_on = False
+        self._recording_alert_last_beep_bucket = -1
+        self._recording_alert_timer = QtCore.QTimer(self)
+        self._recording_alert_timer.setInterval(500)
+        self._recording_alert_timer.timeout.connect(self._recording_alert_tick)
 
         self.telemetry = SessionTelemetryRecorder(self)
         self.telemetry.log_line.connect(self.log)
@@ -1364,6 +1392,9 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.preview_btn = QtWidgets.QPushButton("Open preview?")
         self.telemetry_label = QtWidgets.QLabel("Telemetry: idle")
         self.telemetry_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        self.recording_alert_label = QtWidgets.QLabel("")
+        self.recording_alert_label.setVisible(False)
+        self.recording_alert_label.setStyleSheet("font-weight: bold; color: #b00020;")
 
         settings = QtWidgets.QFormLayout()
         settings.addRow("Mode", self.mode)
@@ -1412,6 +1443,7 @@ class CameraPanel(QtWidgets.QGroupBox):
         right.addWidget(settings_box)
         right.addLayout(sync_row)
         right.addLayout(buttons)
+        right.addWidget(self.recording_alert_label)
         right.addWidget(self.telemetry_label)
         right.addStretch(1)
 
@@ -1698,6 +1730,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         )
         if n_ok == 0 and self.telemetry.is_active():
             self.telemetry.stop_async("camera recording start timed out with no confirmed cameras")
+        elif n_ok > 0 and batch.get("recording_start"):
+            self._set_recording_alert_active(True)
         self._pending_apply_batches.pop(batch_id, None)
 
     def _record_apply_result(self, batch_id: int, full: str, ok: bool, message: str):
@@ -1729,9 +1763,12 @@ class CameraPanel(QtWidgets.QGroupBox):
                 "Apply settings incomplete",
                 f"Applied settings to {n_ok}/{n_total} camera(s).\n\nFailed:\n" + "\n".join(failed),
             )
-        if batch.get("recording_start") and n_ok == 0 and self.telemetry.is_active():
-            self.log("all camera recording starts failed; closing telemetry bag")
-            self.telemetry.stop_async("all camera recording starts failed")
+        if batch.get("recording_start"):
+            if n_ok == 0 and self.telemetry.is_active():
+                self.log("all camera recording starts failed; closing telemetry bag")
+                self.telemetry.stop_async("all camera recording starts failed")
+            elif n_ok > 0:
+                self._set_recording_alert_active(True)
         self._pending_apply_batches.pop(batch_id, None)
 
     def selected_or_warn(self) -> List[str]:
@@ -2034,7 +2071,52 @@ class CameraPanel(QtWidgets.QGroupBox):
                 f"python3 {shlex.quote(str(plotter))} {shlex.quote(str(bag))}"
             )
 
+    def _effective_gui_mode(self) -> str:
+        mode = self.mode.currentData()
+        if mode:
+            return str(mode)
+        baseline = self.baseline_settings.get("mode")
+        return str(baseline or "")
 
+    def _set_recording_alert_active(self, active: bool) -> None:
+        if active and "_rolling" in self._effective_gui_mode():
+            self._recording_alert_started_monotonic = time.monotonic()
+            self._recording_alert_blink_on = True
+            self._recording_alert_last_beep_bucket = -1
+            self.recording_alert_label.setVisible(True)
+            self._recording_alert_timer.start()
+            self._recording_alert_tick()
+            return
+
+        self._recording_alert_timer.stop()
+        self._recording_alert_started_monotonic = None
+        self._recording_alert_last_beep_bucket = -1
+        self.recording_alert_label.setVisible(False)
+        self.recording_alert_label.setText("")
+
+    def _recording_alert_tick(self) -> None:
+        started = self._recording_alert_started_monotonic
+        if started is None:
+            return
+        elapsed = max(0.0, time.monotonic() - started)
+        minutes = int(elapsed) // 60
+        seconds = int(elapsed) % 60
+        self._recording_alert_blink_on = not self._recording_alert_blink_on
+        dot = "●" if self._recording_alert_blink_on else "○"
+        self.recording_alert_label.setText(f"{dot} RECORDING  {minutes:02d}:{seconds:02d}")
+
+        # Starting at 3 minutes, give two short system bells every 30 seconds.
+        if elapsed < 180.0:
+            return
+        bucket = int((elapsed - 180.0) // 30.0)
+        if bucket == self._recording_alert_last_beep_bucket:
+            return
+        self._recording_alert_last_beep_bucket = bucket
+        self.log(f"recording reminder: rolling recording active for {elapsed:.0f} s")
+        QtWidgets.QApplication.beep()
+        # A terminal bell helps on systems where the Qt desktop bell is muted.
+        print("\a", end="", flush=True)
+        QtCore.QTimer.singleShot(180, QtWidgets.QApplication.beep)
 
     def apply_settings(self, activate_after_apply: bool):
         nodes = self.selected_or_warn()
@@ -2167,65 +2249,309 @@ class CameraPanel(QtWidgets.QGroupBox):
             f"camera stop complete ({ok_count}/{total_count} confirmed)"
             + (" after timeout" if timed_out else "")
         )
+        all_stopped = total_count > 0 and ok_count == total_count and not timed_out
+        if all_stopped:
+            self._set_recording_alert_active(False)
+        elif self._recording_alert_started_monotonic is not None:
+            self.log(
+                "recording reminder remains active because camera stop was not fully confirmed"
+            )
         if self.telemetry.is_active():
             QtCore.QTimer.singleShot(350, lambda reason=reason: self.telemetry.stop_async(reason))
         self._pending_stop_batches.pop(batch_id, None)
 
-    def _dump_label(self) -> str:
-        # Keep dump filenames compact. CBRNG already includes:
-        #   output.prefix + run_id + dump000001
-        #
-        # Add only the local clock time so repeated dumps are human-readable:
-        #   ..._dump000001_060603_0000.cbrraw
-        return datetime.now().strftime("%H%M%S")
+    def _dump_label(self, logical_trigger: str) -> str:
+        # Shared across all cameras, and unique enough to pair repeated dumps
+        # later during multi-camera audit.  CBRNG also adds its own dumpNNNNNN.
+        stamp = datetime.now().strftime("%H%M%S_%f")
+        return f"{safe_token(logical_trigger, 'end')}_{stamp}"
 
+    @staticmethod
+    def _optional_nonnegative_seconds(text: str) -> Optional[float]:
+        text = str(text or "").strip()
+        if not text:
+            return None
+        try:
+            value = float(text)
+        except ValueError:
+            return None
+        return value if value >= 0.0 else None
+
+    def _circular_dump_plan(self) -> Tuple[str, float, float, float]:
+        """Return logical trigger type, pre seconds, post seconds, total window.
+
+        All three user-facing modes resolve to the same hardware operation:
+        wait for the desired post-event interval, blank the triggerbox once, and
+        dump the window ending on that shared final trigger edge.
+        """
+        md = self.metadata_panel.current_metadata()
+        logical = str(md.circular_trigger_type or "end").strip().lower()
+        if logical not in {"start", "mid", "end"}:
+            logical = "end"
+
+        pre = self._optional_nonnegative_seconds(md.pre_trigger_s)
+        post = self._optional_nonnegative_seconds(md.post_trigger_s)
+
+        if logical == "end":
+            pre = 4.0 if pre is None else pre
+            post = 0.0 if post is None else post
+        elif logical == "mid":
+            if pre is None and post is None:
+                pre, post = 2.0, 2.0
+            elif pre is None:
+                pre = post
+            elif post is None:
+                post = pre
+        else:  # start
+            pre = 0.0 if pre is None else pre
+            post = 4.0 if post is None else post
+
+        pre = float(pre or 0.0)
+        post = float(post or 0.0)
+        window_s = pre + post
+        if window_s <= 0.0:
+            raise ValueError("circular-buffer window must be greater than zero seconds")
+        return logical, pre, post, window_s
 
     def dump_ram_buffer(self):
         nodes = self.selected_or_warn()
         if not nodes:
             return
-
-        # The camera node uses its active output.dir/output.prefix when output_prefix is empty.
-        # Start recording/apply-with-record should already have put those paths in the current session.
-        label = self._dump_label()
-        trigger_utc_ns = time.time_ns()
-        trigger_position = "post_trigger"
-        window_s = 4.0
-        window_frames = 1000
-        allow_partial = False
-
-        self.log(
-            f"RAM dump request for {len(nodes)} camera(s): "
-            f"trigger_position={trigger_position}, window_frames={window_frames}, "
-            f"window_s={window_s}, allow_partial={allow_partial}, trigger_utc_ns={trigger_utc_ns}, label={label}"
-        )
-        for full in nodes:
-            fut = self.ros.dump_buffer_async(
-                full,
-                label=label,
-                trigger_position=trigger_position,
-                window_s=window_s,
-                window_frames=window_frames,
-                allow_partial=allow_partial,
-                trigger_utc_ns=trigger_utc_ns,
+        if self._active_dump_batch is not None:
+            QtWidgets.QMessageBox.information(
+                self,
+                "RAM dump already active",
+                "A RAM-buffer dump is already waiting, writing, or restoring trigger pulses.",
             )
-            fut.add_done_callback(lambda f, full=full: self._dump_done(full, f))
-
-    def _dump_done(self, full: str, fut):
-        try:
-            resp = fut.result()
-        except Exception as e:
-            self.log(f"RAM dump failed for {full}: {e}")
             return
 
-        ok = bool(resp.success)
-        detail = (
-            f"{resp.message}; frames={resp.frames_written}; "
-            f"trigger={resp.trigger_position}; before={resp.frames_before_trigger}; after={resp.frames_after_trigger}; "
-            f"first={resp.first_file}; metadata={resp.metadata_path}"
+        try:
+            logical, pre_s, post_s, window_s = self._circular_dump_plan()
+        except ValueError as exc:
+            QtWidgets.QMessageBox.warning(self, "Invalid circular-buffer window", str(exc))
+            return
+
+        self._dump_batch_counter += 1
+        batch_id = self._dump_batch_counter
+        label = self._dump_label(logical)
+        event_utc_ns = time.time_ns()
+        self._active_dump_batch = {
+            "id": batch_id,
+            "nodes": list(nodes),
+            "label": label,
+            "logical_trigger": logical,
+            "event_utc_ns": event_utc_ns,
+            "pre_s": pre_s,
+            "post_s": post_s,
+            "window_s": window_s,
+            "remaining": len(nodes),
+            "results": {},
+            "pulses_disabled": False,
+            "finished": False,
+        }
+        self.dump_btn.setEnabled(False)
+        self.log(
+            f"RAM dump event {label}: logical_trigger={logical}, pre={pre_s:.3f}s, "
+            f"post={post_s:.3f}s, window={window_s:.3f}s, cameras={len(nodes)}. "
+            "The triggerbox will define one shared final hardware edge."
         )
+
+        if post_s > 0.0:
+            self.log(f"RAM dump {label}: waiting {post_s:.3f}s of post-event acquisition before stopping pulses")
+            QtCore.QTimer.singleShot(
+                max(1, int(round(post_s * 1000.0))),
+                lambda batch_id=batch_id: self._disable_trigger_for_dump(batch_id),
+            )
+        else:
+            self._disable_trigger_for_dump(batch_id)
+
+    def _dump_batch(self, batch_id: int) -> Optional[Dict[str, Any]]:
+        batch = self._active_dump_batch
+        if batch is None or int(batch.get("id", -1)) != int(batch_id) or batch.get("finished"):
+            return None
+        return batch
+
+    def _disable_trigger_for_dump(self, batch_id: int) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        self.log(f"RAM dump {batch['label']}: disabling physical trigger pulses")
+        try:
+            fut = self.ros.triggerbox_output_async(False)
+        except Exception as exc:
+            self.log(f"RAM dump {batch['label']}: triggerbox disable FAILED - {exc}")
+            self._abort_dump_batch(batch_id, f"Could not disable trigger pulses: {exc}", reenable=False)
+            return
+        fut.add_done_callback(lambda f, batch_id=batch_id: self._triggerbox_disabled_for_dump(batch_id, f))
+
+    def _triggerbox_disabled_for_dump(self, batch_id: int, fut) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        try:
+            resp = fut.result()
+            ok = bool(resp.success)
+            message = str(resp.message)
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        if not ok:
+            self.log(f"RAM dump {batch['label']}: triggerbox disable FAIL - {message}")
+            # The service call was attempted, so its serial command may have been
+            # queued even if the ROS future reports an error. Best-effort E1 is
+            # harmless if E0 never landed and safer than leaving pulses blanked.
+            self._abort_dump_batch(batch_id, f"Triggerbox disable failed: {message}", reenable=True)
+            return
+
+        batch["pulses_disabled"] = True
+        self.log(
+            f"RAM dump {batch['label']}: trigger output disabled; allowing 100 ms for the serial gate "
+            "command and final camera/USB frames to settle"
+        )
+        QtCore.QTimer.singleShot(100, lambda batch_id=batch_id: self._issue_synced_dump_requests(batch_id))
+
+    def _issue_synced_dump_requests(self, batch_id: int) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+
+        # By now no new hardware triggers should be arriving.  A common UTC
+        # anchor after the settle interval resolves to each camera's final
+        # received frame, while CBRNG's end-trigger path writes the preceding
+        # window as fast rolling CBRRAW files.
+        anchor_utc_ns = time.time_ns()
+        batch["anchor_utc_ns"] = anchor_utc_ns
+        self.log(
+            f"RAM dump {batch['label']}: issuing {len(batch['nodes'])} end-window dump request(s), "
+            f"window={batch['window_s']:.3f}s anchor_utc_ns={anchor_utc_ns}"
+        )
+        for full in batch["nodes"]:
+            try:
+                fut = self.ros.dump_buffer_async(
+                    full,
+                    label=batch["label"],
+                    trigger_position="post_trigger",
+                    window_s=float(batch["window_s"]),
+                    window_frames=0,  # derive from recording metadata FPS (e.g. 4 s * 250 Hz = 1000)
+                    allow_partial=False,
+                    trigger_utc_ns=anchor_utc_ns,
+                )
+            except Exception as exc:
+                self.log(f"RAM dump {batch['label']} request failed for {full}: {exc}")
+                batch["results"][full] = False
+                batch["remaining"] -= 1
+                continue
+            fut.add_done_callback(
+                lambda f, full=full, batch_id=batch_id: self._dump_done(batch_id, full, f)
+            )
+
+        if batch["remaining"] <= 0:
+            self._finish_dump_batch(batch_id, timed_out=False)
+            return
+        QtCore.QTimer.singleShot(45000, lambda batch_id=batch_id: self._dump_batch_timeout(batch_id))
+
+    def _dump_done(self, batch_id: int, full: str, fut) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        try:
+            resp = fut.result()
+            ok = bool(resp.success)
+            detail = (
+                f"{resp.message}; frames={resp.frames_written}; "
+                f"trigger={resp.trigger_position}; before={resp.frames_before_trigger}; after={resp.frames_after_trigger}; "
+                f"first={resp.first_file}; metadata={resp.metadata_path}"
+            )
+        except Exception as exc:
+            ok = False
+            detail = str(exc)
+        batch["results"][full] = ok
+        batch["remaining"] -= 1
         self.log(f"{full} RAM dump: {'OK' if ok else 'FAIL'} - {detail}")
         self.refresh_status()
+        if batch["remaining"] <= 0:
+            self._finish_dump_batch(batch_id, timed_out=False)
+
+    def _dump_batch_timeout(self, batch_id: int) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        self.log(
+            f"RAM dump {batch['label']}: timed out with {batch['remaining']} camera response(s) pending; "
+            "restoring trigger pulses"
+        )
+        self._finish_dump_batch(batch_id, timed_out=True)
+
+    def _abort_dump_batch(self, batch_id: int, message: str, *, reenable: bool) -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        self.log(f"RAM dump {batch['label']} aborted: {message}")
+        if reenable:
+            batch["pulses_disabled"] = True
+        self._finish_dump_batch(batch_id, timed_out=True, error_message=message)
+
+    def _finish_dump_batch(self, batch_id: int, timed_out: bool, error_message: str = "") -> None:
+        batch = self._dump_batch(batch_id)
+        if batch is None:
+            return
+        batch["finished"] = True
+        ok_count = sum(1 for value in batch["results"].values() if value)
+        expected = len(batch["nodes"])
+        batch["summary"] = (
+            f"{ok_count}/{expected} camera dump(s) OK"
+            + ("; timed out" if timed_out else "")
+            + (f"; {error_message}" if error_message else "")
+        )
+
+        if batch.get("pulses_disabled"):
+            self.log(f"RAM dump {batch['label']}: restoring physical trigger pulses after dump writes")
+            try:
+                fut = self.ros.triggerbox_output_async(True)
+            except Exception as exc:
+                self._complete_dump_batch(batch_id, False, f"could not re-enable trigger pulses: {exc}")
+                return
+            fut.add_done_callback(lambda f, batch_id=batch_id: self._triggerbox_reenabled_after_dump(batch_id, f))
+            return
+        self._complete_dump_batch(batch_id, True, "")
+
+    def _triggerbox_reenabled_after_dump(self, batch_id: int, fut) -> None:
+        batch = self._active_dump_batch
+        if batch is None or int(batch.get("id", -1)) != int(batch_id):
+            return
+        try:
+            resp = fut.result()
+            ok = bool(resp.success)
+            message = str(resp.message)
+        except Exception as exc:
+            ok = False
+            message = str(exc)
+        self._complete_dump_batch(batch_id, ok, message)
+
+    def _complete_dump_batch(self, batch_id: int, trigger_restored: bool, trigger_message: str) -> None:
+        batch = self._active_dump_batch
+        if batch is None or int(batch.get("id", -1)) != int(batch_id):
+            return
+        summary = str(batch.get("summary", "RAM dump complete"))
+        if trigger_restored:
+            self.log(f"RAM dump {batch['label']} complete: {summary}; trigger pulses restored")
+        else:
+            self.log(f"RAM dump {batch['label']} complete BUT TRIGGER RESTORE FAILED: {trigger_message}; {summary}")
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Trigger pulses not restored",
+                f"RAM dump finished, but trigger output could not be re-enabled.\n\n{trigger_message}",
+            )
+
+        all_ok = len(batch["results"]) == len(batch["nodes"]) and all(batch["results"].values())
+        self._active_dump_batch = None
+        self.dump_btn.setEnabled(True)
+        if trigger_restored and not all_ok:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "RAM dump incomplete",
+                f"RAM dump completed with one or more camera failures.\n\n{summary}",
+            )
 
     def _trigger_done(self, full: str, label: str, fut):
         try:

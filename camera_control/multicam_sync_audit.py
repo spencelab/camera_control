@@ -292,6 +292,126 @@ def _metadata_for_audit(audit: Path) -> Optional[Path]:
     return None
 
 
+
+def _dump_label_from_metadata(path: Optional[Path]) -> Optional[str]:
+    """Return the shared RAM-dump label saved by CBRNG, when present."""
+    if path is None or not path.is_file():
+        return None
+    doc = _load_yaml(path)
+    root = doc.get("cambuffer_recorder_ng", doc)
+    if not isinstance(root, dict):
+        return None
+    for section_name in ("effective_settings", "requested_settings"):
+        settings = root.get(section_name)
+        if not isinstance(settings, dict):
+            continue
+        value = settings.get("ram_buffer.dump.label")
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _run_identity(audit: Path, metadata: Optional[Path]) -> Tuple[str, str]:
+    """Return a stable cross-camera run key and human-readable label.
+
+    RAM dumps carry the same ``ram_buffer.dump.label`` on every camera.  That
+    is the authoritative pairing key.  The filename fallback is only for old
+    dumps whose metadata predates that field.  Ordinary rolling recordings use
+    one singleton ``recording`` group, preserving the old no-guessing rule.
+    """
+    label = _dump_label_from_metadata(metadata)
+    if label:
+        return f"dump:{label}", label
+
+    base = audit.name[: -len(".audit.csv")]
+    match = re.search(r"(?:^|_)dump(\d+)(?:_(.+))?$", base)
+    if match:
+        suffix = (match.group(2) or "").strip("_")
+        if suffix:
+            return f"dump:{suffix}", suffix
+        number = match.group(1)
+        return f"dump_number:{number}", f"dump{number}"
+    return "recording", "recording"
+
+
+def _audit_candidates_for_camera(
+    session_dir: Path,
+    cam: str,
+    processed_subdir: str,
+) -> List[Path]:
+    audits: List[Path] = []
+    for directory in _camera_input_dirs(session_dir, cam, processed_subdir):
+        audits.extend(sorted(directory.glob("*.audit.csv")))
+
+    # A collected copy and an already-consolidated local copy can represent
+    # the same scientific audit.  Deduplicate those without conflating two
+    # genuinely independent runs that happen to have the same byte count.
+    unique: Dict[Tuple[str, int], Path] = {}
+    for path in audits:
+        try:
+            key = (path.name, path.stat().st_size)
+        except OSError:
+            key = (str(path), -1)
+        unique.setdefault(key, path)
+    return list(unique.values())
+
+
+def discover_camera_run_groups(
+    session_dir: Path,
+    cameras: Sequence[str],
+    processed_subdir: str = "processed",
+) -> Tuple[Dict[str, Dict[str, CameraRun]], Dict[str, str], List[str]]:
+    """Discover one or more independent synchronized runs inside a session.
+
+    Repeated RAM dumps are paired by the shared label written into each dump's
+    metadata.  A missing camera in one dump remains visible as an incomplete
+    run instead of causing the other dumps to be discarded.
+    """
+    groups: Dict[str, Dict[str, CameraRun]] = {}
+    labels: Dict[str, str] = {}
+    errors: List[str] = []
+
+    for cam in cameras:
+        audits = _audit_candidates_for_camera(session_dir, cam, processed_subdir)
+        if not audits:
+            errors.append(f"{cam}: no *.audit.csv found")
+            continue
+
+        seen_keys: Dict[str, Path] = {}
+        for audit in audits:
+            metadata = _metadata_for_audit(audit)
+            run_key, label = _run_identity(audit, metadata)
+            if run_key in seen_keys:
+                # Do not guess among multiple ordinary rolling recordings or
+                # duplicate dump labels.  Shared labels are expected to be
+                # unique within a session.
+                errors.append(
+                    f"{cam}: multiple audit runs map to {label!r}: "
+                    f"{seen_keys[run_key].name}, {audit.name}"
+                )
+                continue
+            seen_keys[run_key] = audit
+            try:
+                run = _read_audit_csv(audit, cam, metadata)
+            except Exception as exc:
+                errors.append(f"{cam}/{label}: {exc}")
+                continue
+            groups.setdefault(run_key, {})[cam] = run
+            labels.setdefault(run_key, label)
+
+    return groups, labels, errors
+
+
+def _safe_run_dir_name(label: str, index: int) -> str:
+    token = re.sub(r"[^A-Za-z0-9._-]+", "_", str(label or "run")).strip("._-")
+    if not token:
+        token = "run"
+    return f"{index:03d}_{token[:96]}"
+
+
 def _camera_input_dirs(session_dir: Path, cam: str, processed_subdir: str) -> List[Path]:
     candidates = [
         session_dir / "multicam_sync" / "inputs" / cam,
@@ -312,23 +432,11 @@ def discover_camera_runs(
     cameras: Sequence[str],
     processed_subdir: str = "processed",
 ) -> Tuple[Dict[str, CameraRun], List[str]]:
+    """Legacy single-run discovery used by the per-run audit core."""
     runs: Dict[str, CameraRun] = {}
     errors: List[str] = []
     for cam in cameras:
-        audits: List[Path] = []
-        for directory in _camera_input_dirs(session_dir, cam, processed_subdir):
-            audits.extend(sorted(directory.glob("*.audit.csv")))
-        # Deduplicate by filename+size. A collected input and consolidated local
-        # copy may be the same scientific audit.
-        unique: Dict[Tuple[str, int], Path] = {}
-        for path in audits:
-            try:
-                key = (path.name, path.stat().st_size)
-            except OSError:
-                key = (str(path), -1)
-            unique.setdefault(key, path)
-        audits = list(unique.values())
-
+        audits = _audit_candidates_for_camera(session_dir, cam, processed_subdir)
         if not audits:
             errors.append(f"{cam}: no *.audit.csv found")
             continue
@@ -560,7 +668,7 @@ def _status_marker(output_dir: Path, status: str) -> None:
     )
 
 
-def audit_session(
+def _audit_single_session(
     session_dir: Path | str,
     *,
     expected_cameras: Sequence[str],
@@ -572,10 +680,15 @@ def audit_session(
     max_offset_residual_frames: float = 0.25,
     cadence_tolerance_fraction: float = 0.02,
     log: LogFn = None,
+    output_dir_override: Optional[Path] = None,
+    session_name_override: Optional[str] = None,
+    initial_warnings: Optional[Sequence[str]] = None,
+    initial_errors: Optional[Sequence[str]] = None,
+    runs_override: Optional[Mapping[str, CameraRun]] = None,
 ) -> SyncAuditResult:
     session_dir = Path(session_dir).expanduser().resolve()
-    session = session_dir.name
-    output_dir = session_dir / "multicam_sync"
+    session = str(session_name_override or session_dir.name)
+    output_dir = Path(output_dir_override).resolve() if output_dir_override is not None else session_dir / "multicam_sync"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     expected = list(dict.fromkeys(str(c).strip() for c in expected_cameras if str(c).strip()))
@@ -586,6 +699,10 @@ def audit_session(
         session=session,
         output_dir=output_dir,
     )
+    if initial_warnings:
+        result.warnings.extend(str(item) for item in initial_warnings)
+    if initial_errors:
+        result.errors.extend(str(item) for item in initial_errors)
 
     collection_errors: List[str] = []
     if collect and camera_hosts and remote_sessions_root:
@@ -604,9 +721,12 @@ def audit_session(
         _write_failure_outputs(result)
         return result
 
-    runs, discovery_errors = discover_camera_runs(session_dir, expected, processed_subdir)
-    if discovery_errors:
-        result.errors.extend(discovery_errors)
+    if runs_override is None:
+        runs, discovery_errors = discover_camera_runs(session_dir, expected, processed_subdir)
+        if discovery_errors:
+            result.errors.extend(discovery_errors)
+    else:
+        runs = dict(runs_override)
     if len(runs) != len(expected):
         missing = [cam for cam in expected if cam not in runs]
         if missing:
@@ -939,6 +1059,288 @@ def audit_session(
     result.report_path = report_path
     result.summary_path = summary_path
     result.alignment_path = alignment_path
+    _log(log, f"multicam sync: {headline}; valid={valid:,}/{total:,} ({valid_pct:.3f}%)")
+    return result
+
+
+
+def _write_aggregate_report(path: Path, summary: Mapping[str, Any]) -> None:
+    lines: List[str] = []
+    lines.append("=" * 78)
+    lines.append("MULTI-CAMERA SYNC AUDIT - MULTI-RUN SESSION")
+    lines.append("=" * 78)
+    lines.append(f"Session: {summary.get('session', '')}")
+    lines.append(f"Generated UTC: {summary.get('generated_utc', '')}")
+    lines.append("")
+    lines.append(str(summary.get("headline", summary.get("status", "UNKNOWN"))).upper())
+
+    aggregate = summary.get("aggregate", {})
+    if isinstance(aggregate, dict):
+        lines.append(
+            f"Runs passing alignment: {int(aggregate.get('usable_runs', 0))} / "
+            f"{int(aggregate.get('run_count', 0))}"
+        )
+        total = int(aggregate.get("common_frames", 0))
+        valid = int(aggregate.get("fully_synchronized_frames", 0))
+        pct = float(aggregate.get("valid_percent", 0.0))
+        if total:
+            lines.append(f"Fully synchronized across usable runs: {valid:,} / {total:,} ({pct:.3f}%)")
+
+    lines.append("")
+    lines.append("RUN SUMMARY")
+    lines.append("-" * 78)
+    runs = summary.get("runs", [])
+    if isinstance(runs, list):
+        for item_any in runs:
+            item = item_any if isinstance(item_any, dict) else {}
+            label = str(item.get("label", item.get("run_key", "run")))
+            status = str(item.get("status", "unknown")).upper()
+            total = int(item.get("common_frames", 0) or 0)
+            valid = int(item.get("fully_synchronized_frames", 0) or 0)
+            pct = float(item.get("valid_percent", 0.0) or 0.0)
+            if total:
+                lines.append(f"{label}: {status}  valid={valid:,}/{total:,} ({pct:.3f}%)")
+            else:
+                lines.append(f"{label}: {status}")
+            report = item.get("report_txt")
+            if report:
+                lines.append(f"  report: {report}")
+            errors = item.get("errors", [])
+            if errors:
+                lines.append("  errors: " + "; ".join(str(x) for x in errors[:4]))
+
+    warnings = summary.get("warnings", [])
+    errors = summary.get("errors", [])
+    if warnings:
+        lines.append("")
+        lines.append("WARNINGS")
+        lines.append("-" * 78)
+        for item in warnings:
+            lines.append(f"- {item}")
+    if errors:
+        lines.append("")
+        lines.append("ERRORS")
+        lines.append("-" * 78)
+        for item in errors:
+            lines.append(f"- {item}")
+
+    lines.append("")
+    lines.append(
+        "Each run directory contains its own alignment CSV and detailed report. "
+        "For repeated RAM dumps, the shared CBRNG dump label is the pairing key across cameras."
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def audit_session(
+    session_dir: Path | str,
+    *,
+    expected_cameras: Sequence[str],
+    camera_hosts: Optional[Mapping[str, str]] = None,
+    remote_sessions_root: Optional[str] = None,
+    processed_subdir: str = "processed",
+    ssh_user: str = "spencelab",
+    collect: bool = False,
+    max_offset_residual_frames: float = 0.25,
+    cadence_tolerance_fraction: float = 0.02,
+    log: LogFn = None,
+) -> SyncAuditResult:
+    """Audit one ordinary recording or every labeled RAM dump in a session."""
+    session_dir = Path(session_dir).expanduser().resolve()
+    session = session_dir.name
+    output_dir = session_dir / "multicam_sync"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    expected = list(dict.fromkeys(str(c).strip() for c in expected_cameras if str(c).strip()))
+
+    collection_errors: List[str] = []
+    if collect and camera_hosts and remote_sessions_root:
+        collection_errors = collect_camera_inputs(
+            session_dir,
+            camera_hosts,
+            remote_sessions_root,
+            processed_subdir=processed_subdir,
+            ssh_user=ssh_user,
+            log=log,
+        )
+
+    groups, labels, discovery_errors = discover_camera_run_groups(session_dir, expected, processed_subdir)
+
+    # Preserve the original on-disk layout for the overwhelmingly common
+    # single-recording case.  A single incomplete run also uses the legacy root
+    # outputs so existing GUI/status consumers keep working unchanged.
+    if len(groups) <= 1:
+        stale_runs = output_dir / "runs"
+        if stale_runs.exists():
+            shutil.rmtree(stale_runs)
+        run_key = next(iter(groups), "recording")
+        runs = groups.get(run_key, {})
+        return _audit_single_session(
+            session_dir,
+            expected_cameras=expected,
+            camera_hosts=None,
+            remote_sessions_root=None,
+            processed_subdir=processed_subdir,
+            ssh_user=ssh_user,
+            collect=False,
+            max_offset_residual_frames=max_offset_residual_frames,
+            cadence_tolerance_fraction=cadence_tolerance_fraction,
+            log=log,
+            initial_warnings=collection_errors,
+            initial_errors=discovery_errors,
+            runs_override=runs,
+        )
+
+    # Multiple independent dumps: give every dump a self-contained detailed
+    # report, then write one session-level rollup at the familiar root path.
+    # A multi-run session has no single meaningful root alignment CSV.  Remove
+    # a stale legacy one if this session previously contained only one dump.
+    try:
+        (output_dir / "multicam_sync_alignment.csv").unlink()
+    except FileNotFoundError:
+        pass
+
+    runs_root = output_dir / "runs"
+    if runs_root.exists():
+        shutil.rmtree(runs_root)
+    runs_root.mkdir(parents=True, exist_ok=True)
+
+    ordered_keys = sorted(
+        groups,
+        key=lambda key: min((r.start_pc_utc_ns for r in groups[key].values()), default=0),
+    )
+    run_results: List[Tuple[str, str, SyncAuditResult]] = []
+    for index, run_key in enumerate(ordered_keys, 1):
+        label = labels.get(run_key, run_key)
+        run_output = runs_root / _safe_run_dir_name(label, index)
+        run_output.mkdir(parents=True, exist_ok=True)
+        missing = [cam for cam in expected if cam not in groups[run_key]]
+        run_errors = [f"missing camera audit(s): {','.join(missing)}"] if missing else []
+        _log(log, f"multicam sync: auditing run {index}/{len(ordered_keys)} label={label}")
+        run_result = _audit_single_session(
+            session_dir,
+            expected_cameras=expected,
+            processed_subdir=processed_subdir,
+            collect=False,
+            max_offset_residual_frames=max_offset_residual_frames,
+            cadence_tolerance_fraction=cadence_tolerance_fraction,
+            log=log,
+            output_dir_override=run_output,
+            session_name_override=f"{session}:{label}",
+            initial_errors=run_errors,
+            runs_override=groups[run_key],
+        )
+        run_results.append((run_key, label, run_result))
+
+    # Discovery/collection errors are session-level warnings/errors.  A parse
+    # problem that prevented a run from being grouped makes the aggregate
+    # incomplete rather than silently blessing the remaining dumps.
+    statuses = [item[2].status for item in run_results]
+    if "fail" in statuses:
+        overall_status = "fail"
+    elif "incomplete" in statuses or discovery_errors:
+        overall_status = "incomplete"
+    elif "pass_with_exclusions" in statuses:
+        overall_status = "pass_with_exclusions"
+    else:
+        overall_status = "pass"
+
+    total = sum(r.total_common_frames for _, _, r in run_results if r.total_common_frames > 0)
+    valid = sum(r.valid_frames for _, _, r in run_results if r.total_common_frames > 0)
+    excluded = sum(r.excluded_frames for _, _, r in run_results if r.total_common_frames > 0)
+    valid_pct = (100.0 * valid / total) if total else 0.0
+    usable_runs = sum(1 for _, _, r in run_results if r.status in ("pass", "pass_with_exclusions"))
+    run_count = len(run_results)
+
+    if overall_status == "pass":
+        headline = f"PASS: {usable_runs}/{run_count} RUNS; 0 EXCLUDED FRAMES OUT OF {total:,}"
+    elif overall_status == "pass_with_exclusions":
+        headline = (
+            f"PASS WITH EXCLUSIONS: {usable_runs}/{run_count} RUNS; "
+            f"{excluded:,} EXCLUDED FRAMES OUT OF {total:,}"
+        )
+    elif overall_status == "fail":
+        headline = f"MULTI-CAMERA SYNC AUDIT FAIL: {usable_runs}/{run_count} RUNS USABLE"
+    else:
+        headline = f"MULTI-CAMERA SYNC AUDIT INCOMPLETE: {usable_runs}/{run_count} RUNS USABLE"
+
+    aggregate_errors = list(discovery_errors)
+    aggregate_warnings = list(collection_errors)
+    for _, label, run_result in run_results:
+        if run_result.status not in ("pass", "pass_with_exclusions"):
+            if run_result.errors:
+                aggregate_errors.extend(f"{label}: {item}" for item in run_result.errors)
+            else:
+                aggregate_errors.append(f"{label}: {run_result.status}")
+    summary_runs: List[Dict[str, Any]] = []
+    for run_key, label, r in run_results:
+        summary_runs.append(
+            {
+                "run_key": run_key,
+                "label": label,
+                "status": r.status,
+                "headline": r.headline,
+                "common_frames": r.total_common_frames,
+                "fully_synchronized_frames": r.valid_frames,
+                "excluded_frames": r.excluded_frames,
+                "valid_percent": r.valid_percent,
+                "report_txt": str(r.report_path) if r.report_path else None,
+                "summary_yaml": str(r.summary_path) if r.summary_path else None,
+                "alignment_csv": str(r.alignment_path) if r.alignment_path else None,
+                "warnings": r.warnings,
+                "errors": r.errors,
+            }
+        )
+
+    summary: Dict[str, Any] = {
+        "multicam_sync_audit_version": 2,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "session": session,
+        "status": overall_status,
+        "headline": headline,
+        "camera_count": len(expected),
+        "cameras": expected,
+        "multi_run": True,
+        "run_pairing": "ram_buffer.dump.label",
+        "aggregate": {
+            "run_count": run_count,
+            "usable_runs": usable_runs,
+            "common_frames": total,
+            "fully_synchronized_frames": valid,
+            "excluded_frames": excluded,
+            "valid_percent": valid_pct,
+        },
+        "runs": summary_runs,
+        "warnings": aggregate_warnings,
+        "errors": aggregate_errors,
+        "outputs": {
+            "runs_dir": str(runs_root),
+            "report_txt": str(output_dir / "multicam_sync_report.txt"),
+            "summary_yaml": str(output_dir / "multicam_sync_summary.yaml"),
+        },
+    }
+
+    summary_path = output_dir / "multicam_sync_summary.yaml"
+    report_path = output_dir / "multicam_sync_report.txt"
+    _write_yaml(summary_path, summary)
+    _write_aggregate_report(report_path, summary)
+    _status_marker(output_dir, overall_status)
+
+    result = SyncAuditResult(
+        status=overall_status,
+        ok=overall_status in ("pass", "pass_with_exclusions"),
+        headline=headline,
+        session=session,
+        output_dir=output_dir,
+        report_path=report_path,
+        summary_path=summary_path,
+        alignment_path=None,
+        total_common_frames=total,
+        valid_frames=valid,
+        excluded_frames=excluded,
+        valid_percent=valid_pct,
+        warnings=aggregate_warnings,
+        errors=aggregate_errors,
+    )
     _log(log, f"multicam sync: {headline}; valid={valid:,}/{total:,} ({valid_pct:.3f}%)")
     return result
 
