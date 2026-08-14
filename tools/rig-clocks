@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Show chrony synchronization health across a camera-control rig.
+
+With no --host arguments this preserves the original MERB host list.  The
+camera-control Utilities panel supplies --host entries from the active rig so
+single-purpose/local rigs and alternate camera host mappings work without
+editing this file.
+"""
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from dataclasses import asdict, dataclass
+from typing import Optional
+
+LEGACY_HOSTS = [
+    {"name": "tmill", "address": "10.0.0.10", "skip_source_check": True},
+    {"name": "cam1", "address": "local"},
+    {"name": "cam2", "address": "10.0.0.2"},
+    {"name": "cam3", "address": "10.0.0.3"},
+    {"name": "cam4", "address": "10.0.0.4"},
+    {"name": "cam5", "address": "10.0.0.5"},
+]
+DEFAULT_USER = "spencelab"
+LEGACY_SERVER_ADDRESS = "10.0.0.10"
+WARN_OFFSET = 0.0001
+BAD_OFFSET = 0.001
+REMOTE_COMMAND = "LC_ALL=C chronyc -n tracking; printf '\\n---SOURCES---\\n'; chronyc -n sources"
+
+
+@dataclass
+class Result:
+    host: str
+    address: str
+    source: str = "?"
+    stratum: Optional[int] = None
+    system_time: Optional[float] = None
+    last_offset: Optional[float] = None
+    rms_offset: Optional[float] = None
+    skew_ppm: Optional[float] = None
+    leap: str = "Unknown"
+    state: str = "BAD"
+    error: str = ""
+
+
+def parse_float_prefix(value: str) -> Optional[float]:
+    match = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", value)
+    return float(match.group(0)) if match else None
+
+
+def parse_system_time(value: str) -> Optional[float]:
+    magnitude = parse_float_prefix(value)
+    if magnitude is None:
+        return None
+    if "slow" in value:
+        return -abs(magnitude)
+    if "fast" in value:
+        return abs(magnitude)
+    return magnitude
+
+
+def parse_tracking(text: str) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key == "Stratum":
+            parsed["stratum"] = int(value)
+        elif key == "System time":
+            parsed["system_time"] = parse_system_time(value)
+        elif key == "Last offset":
+            parsed["last_offset"] = parse_float_prefix(value)
+        elif key == "RMS offset":
+            parsed["rms_offset"] = parse_float_prefix(value)
+        elif key == "Skew":
+            parsed["skew_ppm"] = parse_float_prefix(value)
+        elif key == "Leap status":
+            parsed["leap"] = value
+    return parsed
+
+
+def parse_selected_source(text: str) -> str:
+    for line in text.splitlines():
+        if re.match(r"^[\^#]\*", line):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    return "?"
+
+
+def infer_local_source_address(hosts: list[dict[str, str]]) -> Optional[str]:
+    """Infer the local address used to reach the first remote rig host."""
+    remote = next((h["address"] for h in hosts if h["address"] != "local"), None)
+    if not remote:
+        return None
+    try:
+        cp = subprocess.run(
+            ["ip", "route", "get", remote],
+            text=True,
+            capture_output=True,
+            timeout=3,
+            check=False,
+        )
+        if cp.returncode != 0:
+            return None
+        match = re.search(r"\bsrc\s+(\S+)", cp.stdout)
+        return match.group(1) if match else None
+    except Exception:
+        return None
+
+
+def run_command(
+    host: dict[str, str],
+    user: str,
+    key: str,
+    timeout: float,
+    expected_server: Optional[str],
+) -> Result:
+    result = Result(host=host["name"], address=host["address"])
+    try:
+        if host["address"] == "local":
+            command = ["bash", "-lc", REMOTE_COMMAND]
+        else:
+            command = [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", f"ConnectTimeout={max(1, int(timeout))}",
+                "-o", "StrictHostKeyChecking=accept-new",
+            ]
+            if key:
+                expanded = os.path.expanduser(key)
+                if os.path.exists(expanded):
+                    command.extend(["-i", expanded])
+            command.extend([f"{user}@{host['address']}", REMOTE_COMMAND])
+
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=timeout + 3,
+            check=False,
+        )
+        if completed.returncode != 0:
+            result.error = completed.stderr.strip() or f"command rc={completed.returncode}"
+            return result
+
+        tracking, separator, sources = completed.stdout.partition("\n---SOURCES---\n")
+        if not separator:
+            result.error = "missing sources separator"
+            return result
+
+        for key_name, value in parse_tracking(tracking).items():
+            setattr(result, key_name, value)
+        result.source = parse_selected_source(sources)
+
+        if result.leap != "Normal":
+            result.error = f"leap={result.leap}"
+            return result
+        if (
+            host["address"] != "local"
+            and not host.get("skip_source_check", False)
+            and expected_server
+            and result.source != expected_server
+        ):
+            result.error = f"selected source is {result.source}, expected {expected_server}"
+            return result
+
+        metric = result.last_offset
+        if metric is None:
+            result.error = "missing Last offset"
+        elif abs(metric) >= BAD_OFFSET:
+            result.state = "BAD"
+        elif abs(metric) >= WARN_OFFSET:
+            result.state = "WARN"
+        else:
+            result.state = "OK"
+        return result
+    except subprocess.TimeoutExpired:
+        result.error = "timeout"
+        return result
+    except Exception as exc:
+        result.error = str(exc)
+        return result
+
+
+def format_seconds(value: Optional[float]) -> str:
+    if value is None:
+        return "?"
+    sign = "+" if value >= 0 else "-"
+    magnitude = abs(value)
+    if magnitude < 1e-6:
+        return f"{sign}{magnitude * 1e9:.0f}ns"
+    if magnitude < 1e-3:
+        return f"{sign}{magnitude * 1e6:.1f}us"
+    if magnitude < 1:
+        return f"{sign}{magnitude * 1e3:.2f}ms"
+    return f"{sign}{magnitude:.3f}s"
+
+
+def color(text: str, state: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    codes = {"OK": "32", "WARN": "33", "BAD": "31"}
+    return f"\033[{codes.get(state, '0')}m{text}\033[0m"
+
+
+def print_table(results: list[Result], use_color: bool) -> None:
+    headers = ["HOST", "SOURCE", "STRAT", "SYSTEM", "LAST", "RMS", "SKEW", "LEAP", "STATE"]
+    rows = [
+        [
+            r.host,
+            r.source,
+            str(r.stratum if r.stratum is not None else "?"),
+            format_seconds(r.system_time),
+            format_seconds(r.last_offset),
+            format_seconds(r.rms_offset),
+            f"{r.skew_ppm:.3f}" if r.skew_ppm is not None else "?",
+            r.leap,
+            color(r.state, r.state, use_color),
+        ]
+        for r in results
+    ]
+    widths = [max(len(headers[i]), *(len(str(row[i])) for row in rows)) for i in range(len(headers))]
+    print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
+    print("  ".join("-" * widths[i] for i in range(len(headers))))
+    for row in rows:
+        print("  ".join(str(row[i]).ljust(widths[i]) for i in range(len(headers))))
+
+    remote_offsets = [r for r in results if r.address != "local" and r.last_offset is not None]
+    if remote_offsets:
+        worst = max(remote_offsets, key=lambda r: abs(r.last_offset or 0.0))
+        print(f"\nWorst camera offset vs controller: {worst.host} {format_seconds(worst.last_offset)}")
+    for r in results:
+        if r.error:
+            print(f"{r.host}: {r.error}", file=sys.stderr)
+
+
+def parse_host(value: str) -> dict[str, str]:
+    if "=" not in value:
+        raise argparse.ArgumentTypeError("host must be NAME=ADDRESS (ADDRESS may be 'local')")
+    name, address = (part.strip() for part in value.split("=", 1))
+    if not name or not address:
+        raise argparse.ArgumentTypeError("host must be NAME=ADDRESS")
+    return {"name": name, "address": address}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Show chrony clock offsets across camera-control rig computers.")
+    parser.add_argument(
+        "--host",
+        action="append",
+        type=parse_host,
+        default=[],
+        metavar="NAME=ADDRESS",
+        help="host to check; repeat as needed; ADDRESS may be 'local'",
+    )
+    parser.add_argument("--user", default=DEFAULT_USER)
+    parser.add_argument(
+        "--ssh-key",
+        default="",
+        help="optional private key; by default use normal OpenSSH config/agent",
+    )
+    parser.add_argument(
+        "--server-address",
+        default="auto",
+        help="expected chrony server for remote hosts; 'auto' infers controller address; 'none' disables source check",
+    )
+    parser.add_argument("--timeout", type=float, default=4.0)
+    parser.add_argument("--no-color", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+
+    custom_hosts = bool(args.host)
+    hosts = args.host if custom_hosts else list(LEGACY_HOSTS)
+
+    server_arg = str(args.server_address or "auto").strip().lower()
+    if server_arg == "none":
+        expected_server = None
+    elif server_arg == "auto":
+        expected_server = (
+            infer_local_source_address(hosts) if custom_hosts else LEGACY_SERVER_ADDRESS
+        )
+    else:
+        expected_server = args.server_address
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(hosts))) as executor:
+        futures = [
+            executor.submit(run_command, h, args.user, args.ssh_key, args.timeout, expected_server)
+            for h in hosts
+        ]
+        results = [f.result() for f in futures]
+
+    order = {host["name"]: i for i, host in enumerate(hosts)}
+    results.sort(key=lambda r: order.get(r.host, 999))
+
+    if args.json:
+        print(json.dumps([asdict(r) for r in results], indent=2))
+    else:
+        if expected_server:
+            print(f"Expected camera chrony source: {expected_server}\n")
+        print_table(results, sys.stdout.isatty() and not args.no_color)
+
+    if any(r.state == "BAD" for r in results):
+        return 2
+    if any(r.state == "WARN" for r in results):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

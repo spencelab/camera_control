@@ -79,6 +79,15 @@ except Exception:
     ProcessingPanel = None
     PROCESSING_AVAILABLE = False
 
+# Optional utilities tab. Hardware/host checks live in their own module so
+# diagnostics never become part of recording or processing control paths.
+try:
+    from utilities_panel import UtilitiesPanel
+    UTILITIES_AVAILABLE = True
+except Exception:
+    UtilitiesPanel = None
+    UTILITIES_AVAILABLE = False
+
 
 DISCOVERY_INTERVAL_MS = 1500
 STATUS_INTERVAL_MS = 1000
@@ -3044,6 +3053,15 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.processing_panel = None
                 print(f"WARNING: Processing tab disabled: {exc}", file=sys.stderr)
 
+        self.utilities_panel = None
+        if UTILITIES_AVAILABLE:
+            try:
+                self.utilities_panel = UtilitiesPanel(lambda: self.system_panel.active_rig)
+                self.utilities_panel.log_line.connect(self.append_log)
+            except Exception as exc:
+                self.utilities_panel = None
+                print(f"WARNING: Utilities tab disabled: {exc}", file=sys.stderr)
+
         # Optional HIIT trainer (additive). Mounted under the manual treadmill
         # controls on the Treadmill tab; absent entirely if the package or its
         # deps are unavailable, leaving the existing GUI unchanged.
@@ -3094,6 +3112,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self.processing_panel is not None:
             self.tabs.addTab(self.processing_panel, "Processing")
+
+        if self.utilities_panel is not None:
+            self.tabs.addTab(self.utilities_panel, "Utilities")
 
         tab_preview = QtWidgets.QWidget()
         preview_layout = QtWidgets.QVBoxLayout()
