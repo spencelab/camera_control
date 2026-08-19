@@ -17,6 +17,7 @@ main camera cockpit does not grow another tentacle.
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import signal
 import shlex
@@ -37,6 +38,9 @@ try:
 except Exception:
     run_multicam_sync_audit = None
     MULTICAM_SYNC_AUDIT_AVAILABLE = False
+
+
+PROCESSING_ASSIGNMENT_NAME = "processing_assignment.yaml"
 
 
 def _repo_root() -> Path:
@@ -941,6 +945,7 @@ fi
                 self.log.emit(
                     f"Processing: {spec.host}: TRIM_SKIPPED no camera session was deleted during this action"
                 )
+                ok += 1
                 done += 1
                 self.progress.emit(done, total)
             return done, ok
@@ -971,6 +976,11 @@ fi
                         "note=archive_delete_already_complete"
                     )
                 if trim_ok:
+                    ok += 1
+                else:
+                    # TRIM is an optimization after verified archive/delete.
+                    # Surface the failure in the log, but do not turn a safe
+                    # data-transfer workflow into an incomplete receipt.
                     ok += 1
                 done += 1
                 self.progress.emit(done, total)
@@ -2513,6 +2523,275 @@ done < <(find . -maxdepth 1 -type f \( -name "${{CAM}}_first.png" -o -name "${{C
         return True
 
 
+
+def _profile_processing_map(profile: Dict[str, Any]) -> Dict[str, Any]:
+    processing = profile.get("processing", profile)
+    return processing if isinstance(processing, dict) else {}
+
+
+def _profile_label(profile: Dict[str, Any]) -> str:
+    label = str(profile.get("profile_label", "") or "").strip()
+    if label:
+        return label
+    path = str(profile.get("profile_path", "") or "").strip()
+    if path:
+        return Path(path).name
+    return "current visible settings"
+
+
+def _profile_cameras(profile: Dict[str, Any]) -> List[str]:
+    processing = _profile_processing_map(profile)
+    cameras = processing.get("cameras", [])
+    if isinstance(cameras, str):
+        raw = cameras.replace(",", " ").split()
+    elif isinstance(cameras, list):
+        raw = [str(x).strip() for x in cameras]
+    else:
+        raw = []
+    return [x for x in raw if x]
+
+
+def _profile_group_key(profile: Dict[str, Any]) -> str:
+    processing = _profile_processing_map(profile)
+    try:
+        return json.dumps(processing, sort_keys=True, default=str)
+    except Exception:
+        return repr(processing)
+
+
+def _group_sessions_by_profile(session_profiles: Dict[str, Dict[str, Any]]) -> List[tuple[str, List[str], Dict[str, Any]]]:
+    groups: Dict[str, tuple[str, List[str], Dict[str, Any]]] = {}
+    order: List[str] = []
+    for session, profile in session_profiles.items():
+        key = _profile_group_key(profile)
+        if key not in groups:
+            groups[key] = (_profile_label(profile), [], profile)
+            order.append(key)
+        groups[key][1].append(session)
+    return [groups[key] for key in order]
+
+
+class ProfileBatchWorker(QtCore.QObject):
+    """Run a normal PipelineWorker once per distinct assigned profile.
+
+    The underlying PipelineWorker stays intentionally boring and single-profile.
+    This wrapper is the profile-switchboard: it groups selected sessions by the
+    saved effective processing settings in each processing_assignment.yaml and
+    runs those groups sequentially. Per-camera work inside each group remains
+    parallelized exactly as before.
+    """
+
+    log = QtCore.Signal(str)
+    status = QtCore.Signal(str)
+    progress = QtCore.Signal(int, int)
+    finished = QtCore.Signal(str, int, int)
+
+    def __init__(
+        self,
+        *,
+        action: str,
+        session_profiles: Dict[str, Dict[str, Any]],
+        parent: Optional[QtCore.QObject] = None,
+    ):
+        super().__init__(parent)
+        self.action = action
+        self.session_profiles = session_profiles
+        self._cancelled = False
+        self._active_child: Optional[PipelineWorker] = None
+
+    @QtCore.Slot()
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._active_child is not None:
+            self._active_child.cancel()
+
+    def _make_child(self, sessions: List[str], profile: Dict[str, Any]) -> PipelineWorker:
+        processing = _profile_processing_map(profile)
+        conv = processing.get("conversion", {}) if isinstance(processing.get("conversion"), dict) else {}
+        upload = processing.get("upload", {}) if isinstance(processing.get("upload"), dict) else {}
+        cameras = _profile_cameras(profile) or ["cam1", "cam2", "cam3", "cam4", "cam5"]
+
+        return PipelineWorker(
+            action=self.action,
+            base_dir=Path(str(processing.get("local_sessions_root", Path.home() / "camera_sessions"))),
+            remote_sessions_root=str(processing.get("remote_sessions_root", "/home/spencelab/camera_sessions")),
+            sessions=sessions,
+            cameras=cameras,
+            fps=float(conv.get("fps", 5.0)),
+            r_gain=float(conv.get("r_gain", 1.23)),
+            g_gain=float(conv.get("g_gain", 1.0)),
+            b_gain=float(conv.get("b_gain", 1.60)),
+            gamma=float(conv.get("gamma", 1.0)),
+            audit_threshold_frames=float(conv.get("audit_threshold_frames", 1.5)),
+            processed_subdir=str(processing.get("processed_subdir", "processed")),
+            thumbnails_subdir=str(processing.get("thumbnails_subdir", "thumbnails")),
+            manifest_name=str(processing.get("manifest_name", "processing_manifest.tsv")),
+            upload_user=str(upload.get("user", "spencelab")),
+            upload_host=str(upload.get("host", "gpu2")),
+            upload_port=str(upload.get("port", "")),
+            upload_root=str(upload.get("root", "/zfstank3/storage/camera_sessions_uploads")),
+            max_parallel_cameras=max(1, int(processing.get("max_parallel_cameras", 5))),
+            max_parallel_uploads=max(1, int(upload.get("max_parallel_uploads", 5))),
+        )
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        groups = _group_sessions_by_profile(self.session_profiles)
+        total_ok = 0
+        total_done = 0
+        offset = 0
+        advertised_total = max(1, len(self.session_profiles))
+
+        self.log.emit(
+            f"Processing: mixed-profile action '{self.action}' starting for "
+            f"{len(self.session_profiles)} session(s) in {len(groups)} profile group(s)"
+        )
+
+        for index, (label, sessions, profile) in enumerate(groups, start=1):
+            if self._cancelled:
+                break
+            cameras = _profile_cameras(profile)
+            self.log.emit(
+                f"Processing: profile group {index}/{len(groups)}: {label}; "
+                f"sessions={len(sessions)} cameras={' '.join(cameras) if cameras else 'default'}"
+            )
+            self.status.emit(
+                f"Running {self.action}: profile group {index}/{len(groups)}: {label} "
+                f"({len(sessions)} session(s))"
+            )
+
+            child = self._make_child(sessions, profile)
+            child_result = {"ok": 0, "done": 0}
+
+            def on_child_log(text: str) -> None:
+                self.log.emit(text)
+
+            def on_child_status(text: str) -> None:
+                self.status.emit(text)
+
+            def on_child_progress(done: int, total: int) -> None:
+                nonlocal advertised_total
+                advertised_total = max(advertised_total, offset + int(total))
+                self.progress.emit(offset + int(done), advertised_total)
+
+            def on_child_finished(_action: str, ok: int, done: int) -> None:
+                child_result["ok"] = int(ok)
+                child_result["done"] = int(done)
+
+            child.log.connect(on_child_log)
+            child.status.connect(on_child_status)
+            child.progress.connect(on_child_progress)
+            child.finished.connect(on_child_finished)
+            self._active_child = child
+            child.run()
+            self._active_child = None
+
+            total_ok += child_result["ok"]
+            total_done += child_result["done"]
+            offset = total_done
+            advertised_total = max(advertised_total, total_done)
+            self.progress.emit(total_done, advertised_total)
+
+        if self._cancelled:
+            self.log.emit(f"Processing: mixed-profile action '{self.action}' cancelled")
+        self.log.emit(f"Processing: mixed-profile action '{self.action}' complete: {total_ok}/{total_done} step(s) OK")
+        self.progress.emit(total_done, max(1, total_done))
+        self.finished.emit(self.action, total_ok, total_done)
+
+
+class ThumbnailBatchWorker(QtCore.QObject):
+    """Run thumbnail creation once per distinct assigned profile."""
+
+    log = QtCore.Signal(str)
+    progress = QtCore.Signal(int, int)
+    finished = QtCore.Signal(int, int)
+
+    def __init__(
+        self,
+        *,
+        session_profiles: Dict[str, Dict[str, Any]],
+        parent: Optional[QtCore.QObject] = None,
+    ):
+        super().__init__(parent)
+        self.session_profiles = session_profiles
+        self._cancelled = False
+        self._active_child: Optional[ThumbnailWorker] = None
+
+    @QtCore.Slot()
+    def cancel(self) -> None:
+        self._cancelled = True
+        if self._active_child is not None:
+            self._active_child.cancel()
+
+    def _make_child(self, sessions: List[str], profile: Dict[str, Any]) -> ThumbnailWorker:
+        processing = _profile_processing_map(profile)
+        conv = processing.get("conversion", {}) if isinstance(processing.get("conversion"), dict) else {}
+        cameras = _profile_cameras(profile) or ["cam1", "cam2", "cam3", "cam4", "cam5"]
+        return ThumbnailWorker(
+            base_dir=Path(str(processing.get("local_sessions_root", Path.home() / "camera_sessions"))),
+            remote_sessions_root=str(processing.get("remote_sessions_root", "/home/spencelab/camera_sessions")),
+            sessions=sessions,
+            cameras=cameras,
+            r_gain=float(conv.get("r_gain", 1.23)),
+            g_gain=float(conv.get("g_gain", 1.0)),
+            b_gain=float(conv.get("b_gain", 1.60)),
+            gamma=float(conv.get("gamma", 1.0)),
+        )
+
+    @QtCore.Slot()
+    def run(self) -> None:
+        groups = _group_sessions_by_profile(self.session_profiles)
+        total_copied = 0
+        total_expected = 0
+        progress_offset = 0
+        progress_total = max(1, len(self.session_profiles))
+
+        self.log.emit(
+            f"Processing: mixed-profile thumbnail scan starting for "
+            f"{len(self.session_profiles)} session(s) in {len(groups)} profile group(s)"
+        )
+
+        for index, (label, sessions, profile) in enumerate(groups, start=1):
+            if self._cancelled:
+                break
+            cameras = _profile_cameras(profile)
+            self.log.emit(
+                f"Processing: thumbnail profile group {index}/{len(groups)}: {label}; "
+                f"sessions={len(sessions)} cameras={' '.join(cameras) if cameras else 'default'}"
+            )
+            child = self._make_child(sessions, profile)
+            child_result = {"copied": 0, "expected": 0}
+
+            def on_child_log(text: str) -> None:
+                self.log.emit(text)
+
+            def on_child_progress(done: int, total: int) -> None:
+                nonlocal progress_total
+                progress_total = max(progress_total, progress_offset + int(total))
+                self.progress.emit(progress_offset + int(done), progress_total)
+
+            def on_child_finished(copied: int, expected: int) -> None:
+                child_result["copied"] = int(copied)
+                child_result["expected"] = int(expected)
+
+            child.log.connect(on_child_log)
+            child.progress.connect(on_child_progress)
+            child.finished.connect(on_child_finished)
+            self._active_child = child
+            child.run()
+            self._active_child = None
+
+            total_copied += child_result["copied"]
+            total_expected += child_result["expected"]
+            progress_offset += max(1, len(sessions) * max(1, len(cameras)))
+            self.progress.emit(progress_offset, max(progress_total, progress_offset))
+
+        if self._cancelled:
+            self.log.emit("Processing: mixed-profile thumbnail scan cancelled")
+        self.log.emit(f"Processing: mixed-profile thumbnails complete: {total_copied}/{total_expected} copied")
+        self.finished.emit(total_copied, total_expected)
+
+
 class ProcessingPanel(QtWidgets.QWidget):
     """Processing tab for pilot-day thumbnail, conversion, verification, and upload."""
 
@@ -2566,6 +2845,11 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.processing_profile_combo.setMinimumWidth(280)
         self.reload_profiles_btn = QtWidgets.QPushButton("Refresh profiles")
         self.load_config_btn = QtWidgets.QPushButton("Load selected processing YAML")
+        self.apply_profile_btn = QtWidgets.QPushButton("Apply loaded/settings to selected")
+        self.apply_profile_btn.setToolTip(
+            "Write processing_assignment.yaml into each selected session using the currently visible Processing tab settings. "
+            "This captures any temporary white-balance/FPS/upload edits, not just the YAML file path."
+        )
         self._populate_processing_profile_combo()
 
         self.refresh_btn = QtWidgets.QPushButton("Refresh sessions")
@@ -2625,6 +2909,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.processing_profile_combo.currentIndexChanged.connect(self._processing_profile_changed)
         self.reload_profiles_btn.clicked.connect(self.refresh_processing_profiles)
         self.load_config_btn.clicked.connect(self.load_selected_processing_yaml)
+        self.apply_profile_btn.clicked.connect(self.apply_processing_profile_to_selected)
         self.refresh_btn.clicked.connect(self.refresh_sessions)
         self.create_btn.clicked.connect(self.create_thumbnails)
         self.process_btn.clicked.connect(lambda: self.run_pipeline("process"))
@@ -2688,6 +2973,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         profile = QtWidgets.QHBoxLayout()
         profile.addWidget(self.processing_profile_combo, stretch=1)
         profile.addWidget(self.load_config_btn)
+        profile.addWidget(self.apply_profile_btn)
         profile.addWidget(self.reload_profiles_btn)
         top.addRow("Processing YAML", profile)
 
@@ -2862,9 +3148,193 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.load_selected_processing_yaml()
 
 
+    def _session_item_name(self, item: QtWidgets.QListWidgetItem) -> str:
+        value = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return str(value) if value else item.text().split("    [", 1)[0]
+
+    def _assignment_path(self, session: str) -> Path:
+        return self._base_dir() / session / PROCESSING_ASSIGNMENT_NAME
+
+    def _read_session_assignment(self, session: str) -> Optional[Dict[str, Any]]:
+        path = self._assignment_path(session)
+        if not path.is_file():
+            return None
+        try:
+            import yaml  # type: ignore
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            self.log_line.emit(f"Processing: could not read {path}: {exc}")
+            return None
+        if not isinstance(data, dict):
+            return None
+        processing = data.get("processing")
+        if not isinstance(processing, dict):
+            return None
+        return data
+
+    def _session_assignment_label(self, session: str) -> str:
+        data = self._read_session_assignment(session)
+        if data is None:
+            return "unassigned"
+        return _profile_label(data)
+
+    def _session_display_text(self, session: str) -> str:
+        return f"{session}    [{self._session_assignment_label(session)}]"
+
+    def _session_assignment_tooltip(self, session: str) -> str:
+        data = self._read_session_assignment(session)
+        if data is None:
+            return f"{session}\nNo processing assignment yet. Load a YAML, adjust settings if needed, then Apply loaded/settings to selected."
+        processing = _profile_processing_map(data)
+        conv = processing.get("conversion", {}) if isinstance(processing.get("conversion"), dict) else {}
+        upload = processing.get("upload", {}) if isinstance(processing.get("upload"), dict) else {}
+        return "\n".join([
+            session,
+            f"Assigned profile: {_profile_label(data)}",
+            f"Profile path: {data.get('profile_path', '')}",
+            f"Assigned UTC: {data.get('assigned_utc', '')}",
+            f"Cameras: {' '.join(_profile_cameras(data))}",
+            f"Playback FPS: {conv.get('fps', '')}",
+            f"WB: R={conv.get('r_gain', '')} G={conv.get('g_gain', '')} B={conv.get('b_gain', '')} gamma={conv.get('gamma', '')}",
+            f"Upload: {upload.get('user', 'spencelab')}@{upload.get('host', '')}:{upload.get('root', '')}",
+        ])
+
+    def _current_processing_assignment(self) -> Dict[str, Any]:
+        cameras = self._camera_names()
+        processing = {
+            "local_sessions_root": str(self._base_dir()),
+            "remote_sessions_root": self.remote_root_edit.text().strip() or "/home/spencelab/camera_sessions",
+            "cameras": cameras,
+            "max_parallel_cameras": self.max_parallel_cameras,
+            "processed_subdir": self.processed_subdir,
+            "thumbnails_subdir": self.thumbnails_subdir,
+            "manifest_name": self.manifest_name,
+            "conversion": {
+                "fps": float(self.fps_spin.value()),
+                "r_gain": float(self.r_spin.value()),
+                "g_gain": float(self.g_spin.value()),
+                "b_gain": float(self.b_spin.value()),
+                "gamma": float(self.gamma_spin.value()),
+                "audit_threshold_frames": float(self.audit_threshold_frames),
+            },
+            "upload": {
+                "user": self.upload_user_edit.text().strip() or "spencelab",
+                "host": self.upload_host_edit.text().strip() or "gpu2",
+                "port": self.upload_port_edit.text().strip(),
+                "root": self.upload_root_edit.text().strip(),
+                "verify": "size",
+                "max_parallel_uploads": self.max_parallel_uploads,
+            },
+        }
+        return {
+            "version": 1,
+            "profile_path": str(self.processing_config_path),
+            "profile_label": self._profile_label(self.processing_config_path),
+            "assigned_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "assigned_by_host": socket.gethostname(),
+            "note": "Effective Processing tab settings captured at assignment time; GUI edits override the YAML snapshot below.",
+            "processing": processing,
+        }
+
+    @QtCore.Slot()
+    def apply_processing_profile_to_selected(self) -> None:
+        sessions = self._selected_sessions()
+        if not sessions:
+            self.status_label.setText("No sessions selected for profile assignment.")
+            return
+        if not self._camera_names():
+            self.status_label.setText("No camera hosts/nodes configured; not assigning an empty profile.")
+            return
+
+        assignment = self._current_processing_assignment()
+        try:
+            import yaml  # type: ignore
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Cannot write processing assignments",
+                f"PyYAML is required to write {PROCESSING_ASSIGNMENT_NAME}.\n\n{exc}",
+            )
+            return
+
+        written = 0
+        failures: List[str] = []
+        for session in sessions:
+            path = self._assignment_path(session)
+            if not path.parent.is_dir():
+                failures.append(f"{session}: missing local session folder")
+                continue
+            try:
+                path.write_text(yaml.safe_dump(assignment, sort_keys=False), encoding="utf-8")
+                written += 1
+            except Exception as exc:
+                failures.append(f"{session}: {exc}")
+
+        self.refresh_sessions()
+        label = _profile_label(assignment)
+        if failures:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Some assignments failed",
+                f"Assigned {label} to {written}/{len(sessions)} selected session(s).\n\n" + "\n".join(failures[:8]),
+            )
+        self.status_label.setText(f"Assigned {label} to {written}/{len(sessions)} selected session(s).")
+        self.log_line.emit(f"Processing: assigned profile {label} to {written}/{len(sessions)} selected session(s)")
+
+    def _session_profiles_for_run(self, sessions: List[str]) -> Optional[Dict[str, Dict[str, Any]]]:
+        profiles: Dict[str, Dict[str, Any]] = {}
+        missing: List[str] = []
+        current = self._current_processing_assignment()
+        current = dict(current)
+        current["profile_label"] = f"{current.get('profile_label', 'current visible settings')} (current visible settings)"
+        current["assignment_status"] = "not_saved_used_current_visible_settings"
+
+        for session in sessions:
+            data = self._read_session_assignment(session)
+            if data is None:
+                missing.append(session)
+                profiles[session] = current
+            else:
+                profiles[session] = data
+
+        if missing:
+            shown = "\n".join(f"• {name}" for name in missing[:10])
+            if len(missing) > 10:
+                shown += f"\n• ... ({len(missing)} total)"
+            reply = QtWidgets.QMessageBox.warning(
+                self,
+                "Some selected sessions are unassigned",
+                f"{len(missing)} selected session(s) do not have {PROCESSING_ASSIGNMENT_NAME}.\n\n"
+                "They will use the currently visible Processing tab settings for this run only. "
+                "For overnight mixed-profile processing, Cancel and use Apply loaded/settings to selected first.\n\n"
+                f"Unassigned sessions:\n{shown}",
+                QtWidgets.QMessageBox.StandardButton.Ok | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Cancel,
+            )
+            if reply != QtWidgets.QMessageBox.StandardButton.Ok:
+                self.status_label.setText("Processing cancelled: one or more selected sessions were unassigned.")
+                return None
+        return profiles
+
+    def _camera_names_for_profiles(self, session_profiles: Dict[str, Dict[str, Any]]) -> List[str]:
+        out: List[str] = []
+        seen: set[str] = set()
+        for profile in session_profiles.values():
+            for cam in _profile_cameras(profile):
+                if cam not in seen:
+                    out.append(cam)
+                    seen.add(cam)
+        return out
+
+    def _estimated_profile_work_units(self, session_profiles: Dict[str, Dict[str, Any]]) -> int:
+        total = 0
+        for profile in session_profiles.values():
+            total += max(1, len(_profile_cameras(profile)))
+        return max(1, total)
+
     def _set_busy(self, busy: bool) -> None:
         for widget in [
-            self.processing_profile_combo, self.reload_profiles_btn, self.load_config_btn,
+            self.processing_profile_combo, self.reload_profiles_btn, self.load_config_btn, self.apply_profile_btn,
             self.refresh_btn, self.create_btn, self.process_btn, self.info_btn,
             self.audit_btn, self.info_audit_btn, self.multicam_audit_btn, self.verify_btn,
             self.delete_raws_btn, self.upload_btn, self.verify_upload_btn,
@@ -2875,6 +3345,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         self.cancel_btn.setEnabled(busy)
 
     @QtCore.Slot()
+    @QtCore.Slot()
     def refresh_sessions(self) -> None:
         base = self._base_dir()
 
@@ -2883,7 +3354,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         # a carefully chosen subset gets silently replaced by "everything".
         previous_items = self.session_list.count()
         previous_selection = {
-            self.session_list.item(i).text()
+            self._session_item_name(self.session_list.item(i))
             for i in range(previous_items)
             if self.session_list.item(i).isSelected()
         }
@@ -2899,7 +3370,9 @@ class ProcessingPanel(QtWidgets.QWidget):
         initial_load = previous_items == 0
 
         for name in sessions:
-            item = QtWidgets.QListWidgetItem(name)
+            item = QtWidgets.QListWidgetItem(self._session_display_text(name))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, name)
+            item.setToolTip(self._session_assignment_tooltip(name))
             self.session_list.addItem(item)
 
             if previous_selection:
@@ -2913,21 +3386,22 @@ class ProcessingPanel(QtWidgets.QWidget):
             if selected:
                 restored += 1
 
+        assigned = sum(1 for name in sessions if self._read_session_assignment(name) is not None)
         if previous_selection:
             self.status_label.setText(
-                f"Found {len(sessions)} local sessions under {base}; restored {restored} selected."
+                f"Found {len(sessions)} local sessions under {base}; restored {restored} selected; {assigned} assigned."
             )
         else:
-            self.status_label.setText(f"Found {len(sessions)} local sessions under {base}")
+            self.status_label.setText(f"Found {len(sessions)} local sessions under {base}; {assigned} assigned.")
 
     def _selected_sessions(self) -> List[str]:
-        return [item.text() for item in self.session_list.selectedItems()]
+        return [self._session_item_name(item) for item in self.session_list.selectedItems()]
 
     def _end_of_day_log_dir(self) -> Path:
         """Persistent tmill receipts live outside camera_sessions so cleanup cannot remove them."""
         return Path.home() / "camera_control_logs" / "end_of_day"
 
-    def _begin_end_of_day_log(self, action: str, sessions: List[str], cameras: List[str]) -> Path:
+    def _begin_end_of_day_log(self, action: str, sessions: List[str], cameras: List[str], assignments: Optional[Dict[str, Dict[str, Any]]] = None) -> Path:
         """Create a durable tmill receipt before either verified cleanup path starts.
 
         Failure here is intentionally fatal: if camera-control is going to delete
@@ -2957,13 +3431,18 @@ class ProcessingPanel(QtWidgets.QWidget):
         if upload_port:
             upload_target += f" (ssh_port={upload_port})"
 
+        profile_header = str(self.processing_config_path)
+        if assignments:
+            labels = sorted({_profile_label(profile) for profile in assignments.values()})
+            profile_header = "MIXED " + " | ".join(labels)
+
         lines = [
             title,
             f"START_UTC={started.isoformat(timespec='seconds')}",
             f"ACTION={action}",
             f"HOST={socket.gethostname()}",
             f"PID={os.getpid()}",
-            f"PROCESSING_PROFILE={self.processing_config_path}",
+            f"PROCESSING_PROFILE={profile_header}",
             f"LOCAL_SESSIONS_ROOT={self._base_dir()}",
             f"REMOTE_CAMERA_SESSIONS_ROOT={self.remote_root_edit.text().strip() or '/home/spencelab/camera_sessions'}",
             f"UPLOAD_TARGET={upload_target}",
@@ -2972,6 +3451,11 @@ class ProcessingPanel(QtWidgets.QWidget):
             f"CAMERAS={' '.join(cameras)}",
         ]
         lines.extend(f"SESSION_{index:03d}={session}" for index, session in enumerate(sessions, start=1))
+        if assignments:
+            for index, session in enumerate(sessions, start=1):
+                profile = assignments.get(session, {})
+                lines.append(f"SESSION_{index:03d}_PROFILE={_profile_label(profile)}")
+                lines.append(f"SESSION_{index:03d}_PROFILE_PATH={profile.get('profile_path', '')}")
         lines.extend(["", "----- BEGIN PIPELINE LOG -----"])
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -3013,7 +3497,7 @@ class ProcessingPanel(QtWidgets.QWidget):
             return self._last_eod_log_path
 
         total = max(done, self._last_progress_total)
-        success = ok == done == total and not self._persistent_pipeline_log_write_failed
+        success = ((done > 0 and ok == done) or (ok == done == total)) and not self._persistent_pipeline_log_write_failed
         ended = datetime.now(timezone.utc)
         footer = [
             "----- END PIPELINE LOG -----",
@@ -3035,6 +3519,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         return path
 
     @QtCore.Slot()
+    @QtCore.Slot()
     def create_thumbnails(self) -> None:
         if self._thread is not None:
             return
@@ -3042,28 +3527,24 @@ class ProcessingPanel(QtWidgets.QWidget):
         if not sessions:
             self.status_label.setText("No sessions selected.")
             return
-        cameras = self._camera_names()
+        session_profiles = self._session_profiles_for_run(sessions)
+        if session_profiles is None:
+            return
+        cameras = self._camera_names_for_profiles(session_profiles)
         if not cameras:
-            self.status_label.setText("No camera hosts/nodes configured.")
+            self.status_label.setText("No camera hosts/nodes configured in selected session assignments.")
             return
 
-        total = len(sessions) * len(cameras)
+        total = self._estimated_profile_work_units(session_profiles)
         self.progress.setRange(0, total)
         self.progress.setValue(0)
-        self.status_label.setText(f"Creating thumbnails for {len(sessions)} sessions x {len(cameras)} cameras...")
+        self.status_label.setText(
+            f"Creating thumbnails for {len(sessions)} session(s) across assigned processing profile(s)..."
+        )
         self._set_busy(True)
 
         self._thread = QtCore.QThread(self)
-        self._worker = ThumbnailWorker(
-            base_dir=self._base_dir(),
-            remote_sessions_root=self.remote_root_edit.text().strip() or "/home/spencelab/camera_sessions",
-            sessions=sessions,
-            cameras=cameras,
-            r_gain=float(self.r_spin.value()),
-            g_gain=float(self.g_spin.value()),
-            b_gain=float(self.b_spin.value()),
-            gamma=float(self.gamma_spin.value()),
-        )
+        self._worker = ThumbnailBatchWorker(session_profiles=session_profiles)
         self._start_worker(self._worker, self._worker.run, self._worker.finished, self._on_thumbnail_finished)
 
     def run_pipeline(self, action: str) -> None:
@@ -3073,23 +3554,34 @@ class ProcessingPanel(QtWidgets.QWidget):
         if not sessions:
             self.status_label.setText("No sessions selected.")
             return
-        cameras = self._camera_names()
+
+        session_profiles = self._session_profiles_for_run(sessions)
+        if session_profiles is None:
+            return
+        cameras = self._camera_names_for_profiles(session_profiles)
         if not cameras:
-            self.status_label.setText("No camera hosts/nodes configured.")
+            self.status_label.setText("No camera hosts/nodes configured in selected session assignments.")
             return
 
         if action == "process_verify_upload_delete_trim":
             session_text = ", ".join(sessions[:5])
             if len(sessions) > 5:
                 session_text += f", ... ({len(sessions)} total)"
+            profile_labels = sorted({_profile_label(profile) for profile in session_profiles.values()})
+            profile_text = "\n".join(f"• {label}" for label in profile_labels[:10])
+            if len(profile_labels) > 10:
+                profile_text += f"\n• ... ({len(profile_labels)} total)"
             reply = QtWidgets.QMessageBox.warning(
                 self,
                 "End-of-day archive and cleanup?",
                 "This runs PROCESS + VERIFY + UPLOAD + VERIFY UPLOAD + MULTI-CAMERA AUDIT.\n\n"
+                "Each selected session will use its saved processing_assignment.yaml when present; "
+                "any unassigned sessions use the currently visible Processing tab settings only after your warning confirmation.\n\n"
                 "A selected session is deleted from tmill and the configured camera hosts ONLY if every step "
                 "in that session's current run succeeds, and the existing upload/deletion sentinels pass again.\n\n"
                 "After successful camera cleanup, one batch TRIM is attempted on each camera host. "
-                "TRIM failure does not affect the archive or deletion result.\n\n"
+                "TRIM failure is logged as a warning and does not affect the archive/delete result.\n\n"
+                f"Profiles:\n{profile_text}\n\n"
                 f"Sessions: {session_text}",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -3099,7 +3591,7 @@ class ProcessingPanel(QtWidgets.QWidget):
                 return
 
             try:
-                receipt_path = self._begin_end_of_day_log(action, sessions, cameras)
+                receipt_path = self._begin_end_of_day_log(action, sessions, cameras, session_profiles)
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(
                     self,
@@ -3115,6 +3607,10 @@ class ProcessingPanel(QtWidgets.QWidget):
 
         if action == "delete_sessions":
             session_lines = "<br>".join(f"• {s}" for s in sessions)
+            profile_lines = "<br>".join(
+                f"• {session}: {_profile_label(profile)}"
+                for session, profile in list(session_profiles.items())[:12]
+            )
             box = QtWidgets.QMessageBox(self)
             box.setIcon(QtWidgets.QMessageBox.Icon.Critical)
             box.setWindowTitle("DANGER: Permanently delete selected sessions")
@@ -3123,10 +3619,11 @@ class ProcessingPanel(QtWidgets.QWidget):
                 f"<h2>PERMANENTLY DELETE {len(sessions)} SELECTED SESSION(S)?</h2>"
                 "<p><b>This cannot be undone.</b></p>"
                 "<p>The selected session folder(s) will be removed from <b>tmill</b> and "
-                "<b>every configured camera host</b>. Raw files, MP4s, metadata, rosbag data, "
-                "and any other local session contents will be deleted.</p>"
+                "<b>every camera host configured by each session's assigned processing profile</b>. "
+                "Raw files, MP4s, metadata, rosbag data, and any other local session contents will be deleted.</p>"
                 "<p><b>The storage/upload server is NOT touched.</b></p>"
                 f"<p>{session_lines}</p>"
+                f"<p><b>Profiles:</b><br>{profile_lines}</p>"
             )
             cancel_button = box.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
             delete_label = f"DELETE {len(sessions)} SESSION" + ("S" if len(sessions) != 1 else "")
@@ -3142,12 +3639,16 @@ class ProcessingPanel(QtWidgets.QWidget):
             session_text = ", ".join(sessions[:5])
             if len(sessions) > 5:
                 session_text += f", ... ({len(sessions)} total)"
+            profile_labels = sorted({_profile_label(profile) for profile in session_profiles.values()})
+            profile_text = "\n".join(f"• {label}" for label in profile_labels[:10])
             reply = QtWidgets.QMessageBox.warning(
                 self,
                 "Delete uploaded session copies + trim?",
                 "This permanently deletes the selected local session folder(s) and camera-host session folder(s) after upload checks.\n\n"
+                "Each selected session will use its saved processing_assignment.yaml when present. "
                 "It will delete raw files only when local or uploaded VERIFY_OK evidence exists. After successful camera cleanup, "
-                "one batch TRIM is attempted on each camera host. TRIM failure does not affect the archive or deletion result.\n\n"
+                "one batch TRIM is attempted on each camera host. TRIM failure is logged as a warning and does not affect the archive/delete result.\n\n"
+                f"Profiles:\n{profile_text}\n\n"
                 f"Sessions: {session_text}",
                 QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
                 QtWidgets.QMessageBox.StandardButton.Cancel,
@@ -3157,7 +3658,7 @@ class ProcessingPanel(QtWidgets.QWidget):
                 return
 
             try:
-                receipt_path = self._begin_end_of_day_log(action, sessions, cameras)
+                receipt_path = self._begin_end_of_day_log(action, sessions, cameras, session_profiles)
             except Exception as exc:
                 QtWidgets.QMessageBox.critical(
                     self,
@@ -3172,34 +3673,19 @@ class ProcessingPanel(QtWidgets.QWidget):
             self._append_end_of_day_log(f"RECEIPT_READY path={receipt_path}", tag="CONTROL")
 
         self._last_progress_done = 0
-        self._last_progress_total = max(1, len(sessions) * len(cameras))
+        self._last_progress_total = self._estimated_profile_work_units(session_profiles)
         self.progress.setRange(0, self._last_progress_total)
         self.progress.setValue(0)
-        self.status_label.setText(f"Running {action} for {len(sessions)} sessions x {len(cameras)} cameras...")
+        profile_count = len(_group_sessions_by_profile(session_profiles))
+        self.status_label.setText(
+            f"Running {action} for {len(sessions)} session(s) in {profile_count} processing profile group(s)..."
+        )
         self._set_busy(True)
 
         self._thread = QtCore.QThread(self)
-        self._worker = PipelineWorker(
+        self._worker = ProfileBatchWorker(
             action=action,
-            base_dir=self._base_dir(),
-            remote_sessions_root=self.remote_root_edit.text().strip() or "/home/spencelab/camera_sessions",
-            sessions=sessions,
-            cameras=cameras,
-            fps=float(self.fps_spin.value()),
-            r_gain=float(self.r_spin.value()),
-            g_gain=float(self.g_spin.value()),
-            b_gain=float(self.b_spin.value()),
-            gamma=float(self.gamma_spin.value()),
-            audit_threshold_frames=self.audit_threshold_frames,
-            processed_subdir=self.processed_subdir,
-            thumbnails_subdir=self.thumbnails_subdir,
-            manifest_name=self.manifest_name,
-            upload_user=self.upload_user_edit.text().strip(),
-            upload_host=self.upload_host_edit.text().strip(),
-            upload_port=self.upload_port_edit.text().strip(),
-            upload_root=self.upload_root_edit.text().strip(),
-            max_parallel_cameras=self.max_parallel_cameras,
-            max_parallel_uploads=self.max_parallel_uploads,
+            session_profiles=session_profiles,
         )
         self._start_worker(self._worker, self._worker.run, self._worker.finished, self._on_pipeline_finished)
 
@@ -3268,7 +3754,7 @@ class ProcessingPanel(QtWidgets.QWidget):
         receipt_path: Optional[Path] = None
         if action in {"process_verify_upload_delete_trim", "delete_uploaded_session_local"}:
             total = max(done, self._last_progress_total)
-            archive_complete = ok == done == total
+            archive_complete = (done > 0 and ok == done) or (ok == done == total)
             receipt_write_ok = not self._persistent_pipeline_log_write_failed
             receipt_path = self._finish_end_of_day_log(ok, done)
             if action == "delete_uploaded_session_local":
