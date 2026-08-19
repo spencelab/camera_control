@@ -163,6 +163,24 @@ echo "TRIM_OK mount=$MOUNT"
 '''.strip()
 
 
+SPACE_SCRIPT = f'''
+set -eo pipefail
+ROOT={CAMERA_SESSIONS_ROOT!r}
+if [[ ! -d "$ROOT" ]]; then
+    echo "SPACE_FAILED reason=root_missing root=$ROOT"
+    exit 93
+fi
+echo "SPACE_ROOT $ROOT"
+df -h --output=source,fstype,size,used,avail,pcent,target "$ROOT"
+echo ""
+echo "SESSION_ROOT_USAGE"
+du -sh "$ROOT" 2>/dev/null || true
+echo "SESSION_DIR_COUNT $(find "$ROOT" -mindepth 1 -maxdepth 1 -type d | wc -l)"
+echo "LARGEST_SESSIONS"
+du -sh "$ROOT"/* 2>/dev/null | sort -h | tail -n 8 || true
+'''.strip()
+
+
 class UtilityWorker(QtCore.QThread):
     completed = QtCore.Signal(str, bool, str)
 
@@ -220,6 +238,10 @@ class UtilitiesPanel(QtWidgets.QWidget):
         self.trim_btn = QtWidgets.QPushButton("Trim camera drives")
         self.trim_status = QtWidgets.QLabel("Not run")
         self.trim_output = self._output_box(120)
+
+        self.space_btn = QtWidgets.QPushButton("Check space remaining")
+        self.space_status = QtWidgets.QLabel("Not checked")
+        self.space_output = self._output_box(170)
         trim_row = QtWidgets.QHBoxLayout()
         trim_row.addWidget(self.trim_btn)
         trim_row.addWidget(self.trim_status)
@@ -233,16 +255,31 @@ class UtilitiesPanel(QtWidgets.QWidget):
         ))
         trim_layout.addWidget(self.trim_output)
 
+        space_row = QtWidgets.QHBoxLayout()
+        space_row.addWidget(self.space_btn)
+        space_row.addWidget(self.space_status)
+        space_row.addStretch(1)
+        space_group = QtWidgets.QGroupBox("Camera session disk space")
+        space_layout = QtWidgets.QVBoxLayout(space_group)
+        space_layout.addLayout(space_row)
+        space_layout.addWidget(QtWidgets.QLabel(
+            "Checks free space on the filesystem containing /home/spencelab/camera_sessions "
+            "on each camera computer in the active rig."
+        ))
+        space_layout.addWidget(self.space_output)
+
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addWidget(self.rig_label)
         layout.addWidget(clock_group)
         layout.addWidget(usb_group)
+        layout.addWidget(space_group)
         layout.addWidget(trim_group)
         layout.addStretch(1)
 
         self.clock_btn.clicked.connect(self.check_clocks)
         self.usb_btn.clicked.connect(self.check_usb)
+        self.space_btn.clicked.connect(self.check_space)
         self.trim_btn.clicked.connect(self.trim_drives)
         self._refresh_rig_label()
 
@@ -250,7 +287,18 @@ class UtilitiesPanel(QtWidgets.QWidget):
     def _output_box(min_height: int) -> QtWidgets.QPlainTextEdit:
         box = QtWidgets.QPlainTextEdit()
         box.setReadOnly(True)
-        box.setMinimumHeight(min_height)
+
+        # Keep diagnostics useful without letting the Utilities tab dictate the
+        # whole main-window height. QTabWidget uses the largest tab's size hint,
+        # so several tall output panes can make the GUI launch as a skyscraper.
+        height = max(70, min(int(min_height), 110))
+        box.setMinimumHeight(0)
+        box.setFixedHeight(height)
+        box.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+
         box.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         font = box.font()
         font.setFamily("monospace")
@@ -285,6 +333,7 @@ class UtilitiesPanel(QtWidgets.QWidget):
         mapping = {
             "clocks": (self.clock_btn, self.clock_status),
             "usb": (self.usb_btn, self.usb_status),
+            "space": (self.space_btn, self.space_status),
             "trim": (self.trim_btn, self.trim_status),
         }
         button, status = mapping[name]
@@ -297,6 +346,7 @@ class UtilitiesPanel(QtWidgets.QWidget):
         mapping = {
             "clocks": (self.clock_status, self.clock_output),
             "usb": (self.usb_status, self.usb_output),
+            "space": (self.space_status, self.space_output),
             "trim": (self.trim_status, self.trim_output),
         }
         status, output = mapping[name]
@@ -361,6 +411,28 @@ class UtilitiesPanel(QtWidgets.QWidget):
             return all_ok, "\n".join(lines).rstrip()
 
         self._start("usb", work)
+
+    def check_space(self) -> None:
+        specs = unique_computers(self._camera_hosts())
+        self.space_output.clear()
+        if not specs:
+            self.space_status.setText("N/A")
+            self.space_output.setPlainText("No camera computers are defined by the active rig.")
+            return
+
+        def work() -> tuple[bool, str]:
+            results = _run_parallel(specs, SPACE_SCRIPT, timeout=30)
+            lines: list[str] = []
+            all_ok = True
+            for result in results:
+                all_ok = all_ok and result.ok
+                state = "OK" if result.ok else "CHECK"
+                lines.append(f"===== {result.label} @ {result.host}: {state} =====")
+                lines.append(result.output or f"command exited {result.returncode} with no output")
+                lines.append("")
+            return all_ok, "\n".join(lines).rstrip()
+
+        self._start("space", work)
 
     def trim_drives(self) -> None:
         specs = unique_computers(self._camera_hosts())

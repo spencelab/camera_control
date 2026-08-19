@@ -1338,6 +1338,8 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._recording_alert_started_monotonic: Optional[float] = None
         self._recording_alert_blink_on = False
         self._recording_alert_last_beep_bucket = -1
+        self._dump_alert_count = 0
+        self._dump_alert_blink_on = False
         self._recording_alert_timer = QtCore.QTimer(self)
         self._recording_alert_timer.setInterval(500)
         self._recording_alert_timer.timeout.connect(self._recording_alert_tick)
@@ -1404,6 +1406,12 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.recording_alert_label = QtWidgets.QLabel("")
         self.recording_alert_label.setVisible(False)
         self.recording_alert_label.setStyleSheet("font-weight: bold; color: #b00020;")
+        self.recording_alert_label.setMinimumHeight(0)
+        self.recording_alert_label.setMaximumHeight(28)
+        self.recording_alert_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
 
         settings = QtWidgets.QFormLayout()
         settings.addRow("Mode", self.mode)
@@ -2087,6 +2095,14 @@ class CameraPanel(QtWidgets.QGroupBox):
         baseline = self.baseline_settings.get("mode")
         return str(baseline or "")
 
+    def _is_ram_buffer_mode(self) -> bool:
+        return "ram_buffer" in self._effective_gui_mode()
+
+    def _update_dump_alert_label(self) -> None:
+        self._dump_alert_blink_on = not self._dump_alert_blink_on
+        dot = "●" if self._dump_alert_blink_on else "○"
+        self.recording_alert_label.setText(f"{dot} DUMP {self._dump_alert_count}")
+
     def _set_recording_alert_active(self, active: bool) -> None:
         if active and "_rolling" in self._effective_gui_mode():
             self._recording_alert_started_monotonic = time.monotonic()
@@ -2097,9 +2113,20 @@ class CameraPanel(QtWidgets.QGroupBox):
             self._recording_alert_tick()
             return
 
+        if active and self._is_ram_buffer_mode():
+            self._recording_alert_timer.stop()
+            self._recording_alert_started_monotonic = None
+            self._recording_alert_last_beep_bucket = -1
+            self._dump_alert_count = 0
+            self._dump_alert_blink_on = True
+            self.recording_alert_label.setVisible(True)
+            self._update_dump_alert_label()
+            return
+
         self._recording_alert_timer.stop()
         self._recording_alert_started_monotonic = None
         self._recording_alert_last_beep_bucket = -1
+        self._dump_alert_count = 0
         self.recording_alert_label.setVisible(False)
         self.recording_alert_label.setText("")
 
@@ -2553,6 +2580,9 @@ class CameraPanel(QtWidgets.QGroupBox):
             )
 
         all_ok = len(batch["results"]) == len(batch["nodes"]) and all(batch["results"].values())
+        if all_ok and self.recording_alert_label.isVisible() and self._is_ram_buffer_mode():
+            self._dump_alert_count += 1
+            self._update_dump_alert_label()
         self._active_dump_batch = None
         self.dump_btn.setEnabled(True)
         if trigger_restored and not all_ok:
@@ -3132,6 +3162,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.resize(1250, 760)
 
         self.metadata_summary.edit_requested.connect(self.goto_metadata_tab)
+        self.tabs.currentChanged.connect(self._tab_changed)
         QtCore.QTimer.singleShot(100, self.camera_panel.discover)
 
     def keyPressEvent(self, event):
@@ -3300,6 +3331,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._close_cleanup_complete = True
         self._close_cleanup_in_progress = False
         QtCore.QTimer.singleShot(0, self.close)
+
+    def _tab_changed(self, index: int) -> None:
+        widget = self.tabs.widget(index)
+        if self.processing_panel is not None and widget is self.processing_panel:
+            if getattr(self.processing_panel, "_worker", None) is None:
+                self.processing_panel.refresh_sessions()
 
     def goto_metadata_tab(self):
         self.tabs.setCurrentIndex(1)

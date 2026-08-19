@@ -269,6 +269,7 @@ class ThumbnailWorker(QtCore.QObject):
         self._cancelled = True
 
     @QtCore.Slot()
+    @QtCore.Slot()
     def run(self) -> None:
         jobs = [
             ThumbnailJob(
@@ -280,22 +281,28 @@ class ThumbnailWorker(QtCore.QObject):
             for session in self.sessions
             for spec in self.camera_specs
         ]
-        total = len(jobs)
-        done = 0
-        ok = 0
-        self.log.emit(f"Processing: thumbnail scan starting for {len(self.sessions)} sessions x {len(self.camera_specs)} cameras")
+        total_jobs = len(jobs)
+        job_done = 0
+        copied_total = 0
+        expected_total = 0
+        self.log.emit(
+            f"Processing: thumbnail scan starting for {len(self.sessions)} sessions x {len(self.camera_specs)} cameras"
+        )
 
         for job in jobs:
             if self._cancelled:
                 self.log.emit("Processing: cancelled")
                 break
-            if self._process_one(job):
-                ok += 1
-            done += 1
-            self.progress.emit(done, total)
+            copied, expected = self._process_one(job)
+            copied_total += copied
+            expected_total += expected
+            job_done += 1
+            self.progress.emit(job_done, total_jobs)
 
-        self.log.emit(f"Processing: thumbnails complete: {ok}/{done} copied")
-        self.finished.emit(ok, done)
+        if expected_total == 0 and job_done:
+            expected_total = job_done
+        self.log.emit(f"Processing: thumbnails complete: {copied_total}/{expected_total} copied")
+        self.finished.emit(copied_total, expected_total)
 
     def _run_local(self, argv: List[str], *, timeout_s: int = 60) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -309,8 +316,8 @@ class ThumbnailWorker(QtCore.QObject):
 
     def _remote_script(self, session: str, cam: str) -> str:
         # The camera node records into that host's local camera_sessions tree.
-        # Keep annotation function outside the f-string so bash/Python braces do
-        # not become a brace confetti incident.
+        # Generate one thumbnail for every independent raw start. Rolling runs
+        # normally have one start; RAM multi-dump sessions have one start per dump.
         annotate_script = r"""
 annotate_thumbnail() {
   local png="$1"
@@ -453,94 +460,131 @@ if [[ "${{#RAW_STARTS[@]}}" == "0" ]]; then
   echo "NO_CBRRAW $DIR"
   exit 21
 fi
-RAW="${{RAW_STARTS[-1]}}"
-echo "THUMBNAIL_USING $(basename "$RAW") of ${{#RAW_STARTS[@]}} raw starts"
+echo "THUMBNAIL_RAW_START_COUNT $CAM ${{#RAW_STARTS[@]}}"
 
-META="${{RAW%_0000.cbrraw}}.metadata.yaml"
-if [[ ! -f "$META" ]]; then
+metadata_for_raw() {{
+  local raw="$1"
+  local prefix="${{raw%_0000.cbrraw}}"
+  local base
+  base="$(basename "$prefix")"
+  local meta="${{prefix}}.metadata.yaml"
+  if [[ -f "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+  local session_base
+  session_base="$(printf '%s\n' "$base" | sed -E 's/_[0-9]{{8}}T[0-9]{{6}}Z.*$//')"
+  meta="$DIR/${{session_base}}.metadata.yaml"
+  if [[ -f "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+  meta=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" ! -name '*dump[0-9]*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+  meta=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
+  if [[ -n "$meta" ]]; then
+    echo "$meta"
+    return 0
+  fi
+  echo none
+}}
+
+LAST_PNG=""
+for RAW in "${{RAW_STARTS[@]}}"; do
   BASE="$(basename "${{RAW%_0000.cbrraw}}")"
-  SESSION_BASE="$(printf '%s\n' "$BASE" | sed -E 's/_[0-9]{{8}}T[0-9]{{6}}Z.*$//')"
-  META_BY_BASE="$DIR/${{SESSION_BASE}}.metadata.yaml"
-  if [[ -f "$META_BY_BASE" ]]; then
-    META="$META_BY_BASE"
-  fi
-fi
-if [[ ! -f "$META" ]]; then
-  META_BY_CAM=$(find "$DIR" -maxdepth 1 -type f -name "${{CAM}}_*.metadata.yaml" ! -name '*dump[0-9]*.metadata.yaml' | sort | head -n 1)
-  if [[ -n "$META_BY_CAM" ]]; then
-    META="$META_BY_CAM"
-  fi
-fi
-if [[ ! -f "$META" ]]; then
-  META_ANY=$(find "$DIR" -maxdepth 1 -type f -name '*.metadata.yaml' | sort | head -n 1)
-  if [[ -n "$META_ANY" ]]; then
-    META="$META_ANY"
-  fi
-fi
+  META="$(metadata_for_raw "$RAW")"
+  PNG="$DIR/${{BASE}}.first.png"
+  echo "THUMBNAIL_USING $BASE raw=$(basename "$RAW")"
+  echo "THUMBNAIL_WB R={r} G={g} B={b} gamma=$gamma"
+  ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$PNG" 1 0 "$META" {r} {g} {b} "$gamma"
+  annotate_thumbnail "$PNG" "$RAW" "$META" {r} {g} {b} || true
+  echo "THUMBNAIL_PNG $PNG"
+  LAST_PNG="$PNG"
+done
 
-PNG="$DIR/{cam}_first.png"
-if [[ ! -f "$META" ]]; then
-  META=none
+# Compatibility thumbnail for old workflows and humans looking for cam1_first.png.
+if [[ -n "$LAST_PNG" && -f "$LAST_PNG" ]]; then
+  LEGACY_PNG="$DIR/${{CAM}}_first.png"
+  cp -f "$LAST_PNG" "$LEGACY_PNG"
+  echo "THUMBNAIL_PNG $LEGACY_PNG"
 fi
-
-echo "THUMBNAIL_WB R={r} G={g} B={b} gamma=$gamma"
-ros2 run cambuffer_recorder_ng raw_rolling_to_mp4 "$RAW" "$PNG" 1 0 "$META" {r} {g} {b} "$gamma"
-
-# Annotation is nice-to-have; never let it turn a good PNG into a failed job.
-annotate_thumbnail "$PNG" "$RAW" "$META" {r} {g} {b} || true
-
-# Keep the PNG path as the final line; _process_one copies this.
-echo "$PNG"
 """.strip()
 
-    def _process_one(self, job: ThumbnailJob) -> bool:
+    def _process_one(self, job: ThumbnailJob) -> tuple[int, int]:
         job.local_thumb.parent.mkdir(parents=True, exist_ok=True)
         remote_script = self._remote_script(job.session, job.cam)
-        self.log.emit(f"Processing: {job.session}/{job.cam}: extracting first frame on {job.host}")
+        self.log.emit(f"Processing: {job.session}/{job.cam}: extracting first frames on {job.host}")
 
         try:
             if _is_local_host(job.host):
-                proc = self._run_local(["bash", "-lc", remote_script], timeout_s=120)
+                proc = self._run_local(["bash", "-lc", remote_script], timeout_s=240)
             else:
                 proc = self._run_local(
                     ["ssh", "-T", f"spencelab@{job.host}", remote_script],
-                    timeout_s=120,
+                    timeout_s=240,
                 )
         except subprocess.TimeoutExpired:
             self.log.emit(f"Processing: {job.session}/{job.cam}: TIMEOUT during frame extraction")
-            return False
+            return (0, 1)
 
         out = (proc.stdout or "").strip()
         if proc.returncode != 0:
-            # Missing sessions are expected when tmill has session.yaml but that camera did not record.
-            self.log.emit(f"Processing: {job.session}/{job.cam}: skip/fail rc={proc.returncode}: {_tail(out, 4)}")
-            return False
+            self.log.emit(f"Processing: {job.session}/{job.cam}: skip/fail rc={proc.returncode}: {_tail(out, 6)}")
+            return (0, 1)
 
-        remote_png = out.splitlines()[-1].strip() if out else f"{self.remote_sessions_root}/{job.session}/{job.cam}/{job.cam}_first.png"
-        self.log.emit(f"Processing: {job.session}/{job.cam}: copying thumbnail to {job.local_thumb}")
-        if _is_local_host(job.host):
+        remote_pngs: List[str] = []
+        expected = 0
+        for line in out.splitlines():
+            if line.startswith("THUMBNAIL_RAW_START_COUNT "):
+                parts = line.split()
+                if parts and parts[-1].isdigit():
+                    expected += int(parts[-1])
+            elif line.startswith("THUMBNAIL_PNG "):
+                remote_pngs.append(line.split(" ", 1)[1].strip())
+
+        if not remote_pngs:
+            fallback = f"{self.remote_sessions_root}/{job.session}/{job.cam}/{job.cam}_first.png"
+            remote_pngs = [fallback]
+            expected = max(expected, 1)
+
+        copied = 0
+        for remote_png in remote_pngs:
+            name = Path(remote_png).name
+            local_thumb = job.local_thumb.parent / name
+            self.log.emit(f"Processing: {job.session}/{job.cam}: copying thumbnail to {local_thumb}")
+            if _is_local_host(job.host):
+                try:
+                    shutil.copy2(Path(remote_png).expanduser(), local_thumb)
+                except Exception as exc:
+                    self.log.emit(f"Processing: {job.session}/{job.cam}: local thumbnail copy failed: {exc}")
+                    continue
+                copied += 1
+                continue
+
             try:
-                shutil.copy2(Path(remote_png).expanduser(), job.local_thumb)
-            except Exception as exc:
-                self.log.emit(f"Processing: {job.session}/{job.cam}: local thumbnail copy failed: {exc}")
-                return False
-            return True
+                scp = self._run_local(
+                    ["scp", "-q", f"spencelab@{job.host}:{remote_png}", str(local_thumb)],
+                    timeout_s=60,
+                )
+            except subprocess.TimeoutExpired:
+                self.log.emit(f"Processing: {job.session}/{job.cam}: TIMEOUT during scp of {name}")
+                continue
 
-        try:
-            scp = self._run_local(
-                ["scp", "-q", f"spencelab@{job.host}:{remote_png}", str(job.local_thumb)],
-                timeout_s=60,
-            )
-        except subprocess.TimeoutExpired:
-            self.log.emit(f"Processing: {job.session}/{job.cam}: TIMEOUT during scp")
-            return False
+            if scp.returncode != 0:
+                self.log.emit(
+                    f"Processing: {job.session}/{job.cam}: scp failed rc={scp.returncode}: {_tail(scp.stdout, 4)}"
+                )
+                continue
+            copied += 1
 
-        if scp.returncode != 0:
-            self.log.emit(f"Processing: {job.session}/{job.cam}: scp failed rc={scp.returncode}: {_tail(scp.stdout, 4)}")
-            return False
-
-        return True
-
+        expected = max(expected, len([p for p in remote_pngs if not Path(p).name.endswith('_first.png')]))
+        expected = max(expected, 1)
+        if copied:
+            self.log.emit(f"Processing: {job.session}/{job.cam}: copied {copied}/{len(remote_pngs)} thumbnail file(s)")
+        return (copied, expected)
 
 @dataclass(frozen=True)
 class PipelineJob:
@@ -754,7 +798,7 @@ class PipelineWorker(QtCore.QObject):
                     self.progress.emit(done, total)
                 else:
                     msg = (
-                        "SAFE_EOD_DELETE_SKIPPED prior process/verify/upload/multicam step failed; "
+                        "SAFE_EOD_DELETE_SKIPPED prior required archive step failed; "
                         "no local session data deleted"
                     )
                     self.log.emit(f"Processing: {session}: {msg}")
@@ -1001,18 +1045,31 @@ fi
 
         return done, ok
 
+    def _auto_multicam_steps(self) -> List[str]:
+        """Auto-run sync audit only for real multi-camera processing profiles.
+
+        Single-camera local testing should still process, verify, upload, delete,
+        and trim. A sync audit with one expected camera is not a data failure; it
+        is simply not a meaningful multi-camera test.
+        """
+        expected_cameras = {spec.cam for spec in self.camera_specs}
+        return ["multicam_sync"] if len(expected_cameras) >= 2 else []
+
     def _expand_action(self, action: str) -> List[str]:
+        auto_sync = self._auto_multicam_steps()
+
         if action == "process":
-            return ["process", "multicam_sync"]
+            return ["process"] + auto_sync
         if action == "info":
             return ["info"]
         if action == "audit":
             return ["audit"]
         if action == "info_audit":
-            return ["info", "audit", "multicam_sync"]
+            return ["info", "audit"] + auto_sync
         if action == "multicam_sync":
-            # Standalone GUI sync audit: generate/refresh the per-camera raw
-            # info + audit CSV prerequisites before reconstructing alignment.
+            # Standalone GUI sync audit: generate/refresh prerequisites before
+            # reconstructing alignment. On single-camera profiles this now logs
+            # a clean skip instead of poisoning cleanup gates.
             return ["info", "audit", "multicam_sync"]
         if action == "verify":
             return ["verify"]
@@ -1029,15 +1086,14 @@ fi
         if action == "delete_sessions":
             return ["delete_session_force", "delete_session_force_local"]
         if action == "process_verify":
-            return ["process", "verify", "multicam_sync"]
+            return ["process", "verify"] + auto_sync
         if action == "upload_verify":
             return ["upload_session", "upload", "verify_upload"]
         if action == "process_verify_upload":
-            return ["process", "verify", "upload_session", "upload", "verify_upload", "multicam_sync"]
+            return ["process", "verify", "upload_session", "upload", "verify_upload"] + auto_sync
         if action == "process_verify_upload_delete_trim":
-            # Cleanup and TRIM are intentionally handled as post-verification
-            # phases in run(), after the final session-level upload pass.
-            return ["process", "verify", "upload_session", "upload", "verify_upload", "multicam_sync"]
+            # Cleanup and TRIM are handled as post-verification phases in run().
+            return ["process", "verify", "upload_session", "upload", "verify_upload"] + auto_sync
         return [action]
 
     def _run_local(self, argv: List[str], *, timeout_s: int = 600) -> subprocess.CompletedProcess:
@@ -1769,12 +1825,12 @@ if [[ "${{#ROOT_METADATA[@]}}" == "0" ]]; then
   exit 51
 fi
 rsync -a --partial -e "$RSYNC_RSH" "${{ROOT_METADATA[@]}}" "$STORAGE:$CAM_DEST/"
-ROOT_THUMB="$DIR/${{CAM}}_first.png"
-if [[ -f "$ROOT_THUMB" ]]; then
-  rsync -a --partial -e "$RSYNC_RSH" "$ROOT_THUMB" "$STORAGE:$CAM_DEST/"
+mapfile -t ROOT_THUMBS < <(find "$DIR" -maxdepth 1 -type f \( -name "${{CAM}}_first.png" -o -name "${{CAM}}_*.first.png" \) | sort)
+if [[ "${{#ROOT_THUMBS[@]}}" != "0" ]]; then
+  rsync -a --partial -e "$RSYNC_RSH" "${{ROOT_THUMBS[@]}}" "$STORAGE:$CAM_DEST/"
 fi
 
-echo "UPLOADED $CAM to $STORAGE:$CAM_DEST processed_files=$(find "$PROC_DIR" -maxdepth 1 -type f | wc -l) root_metadata=${{#ROOT_METADATA[@]}} thumbnail=$([[ -f "$ROOT_THUMB" ]] && echo yes || echo no)"
+echo "UPLOADED $CAM to $STORAGE:$CAM_DEST processed_files=$(find "$PROC_DIR" -maxdepth 1 -type f | wc -l) root_metadata=${{#ROOT_METADATA[@]}} thumbnails=${{#ROOT_THUMBS[@]}}"
 """.strip()
 
     def _script_verify_upload(self, job: PipelineJob) -> str:
@@ -1796,9 +1852,7 @@ trap 'rm -f "$LOCAL_LIST" "$REMOTE_LIST"' EXIT
     ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' \\
     -printf '%P\t%s\n' | sed 's#^#processed/#'
   find . -maxdepth 1 -type f -name '*.metadata.yaml' -printf '%P\t%s\n'
-  if [[ -f "${{CAM}}_first.png" ]]; then
-    stat -c '%n\t%s' "${{CAM}}_first.png"
-  fi
+  find . -maxdepth 1 -type f \( -name "${{CAM}}_first.png" -o -name "${{CAM}}_*.first.png" \) -printf '%P\t%s\n'
 ) | sort > "$LOCAL_LIST"
 
 if ! grep -qE '^[^/]+\\.metadata\\.yaml[[:space:]]' "$LOCAL_LIST"; then
@@ -1815,9 +1869,7 @@ ssh "${{SSH_ARGS[@]}}" "$STORAGE" "
       ! -name '*.upload_sizes.tsv' ! -name '.upload_sizes.tsv' \\
       -printf '%P\t%s\n' | sed 's#^#processed/#'
     find . -maxdepth 1 -type f -name '*.metadata.yaml' -printf '%P\t%s\n'
-    if [[ -f '${{CAM}}_first.png' ]]; then
-      stat -c '%n\t%s' '${{CAM}}_first.png'
-    fi
+    find . -maxdepth 1 -type f \( -name '${{CAM}}_first.png' -o -name '${{CAM}}_*.first.png' \) -printf '%P\t%s\n'
   }} | sort
 " > "$REMOTE_LIST"
 
@@ -1911,13 +1963,25 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES marker=$MARKER"
 
     def _run_multicam_sync_audit(self, session: str) -> bool:
         local_dir = self.base_dir / session
-        if not MULTICAM_SYNC_AUDIT_AVAILABLE or run_multicam_sync_audit is None:
-            msg = "MULTICAM_SYNC_AUDIT_UNAVAILABLE import failed"
+        if not local_dir.is_dir():
+            msg = f"NO_LOCAL_SESSION_DIR {local_dir}"
             self.log.emit(f"Processing: {session}/multicam: FAIL: {msg}")
             self._append_manifest(session, "multicam", "multicam_sync", False, msg)
             return False
-        if not local_dir.is_dir():
-            msg = f"NO_LOCAL_SESSION_DIR {local_dir}"
+
+        expected_cameras = sorted({spec.cam for spec in self.camera_specs})
+        if len(expected_cameras) < 2:
+            detail = (
+                "MULTICAM_SYNC_SKIPPED_SINGLE_CAMERA "
+                f"expected_cameras={','.join(expected_cameras) if expected_cameras else 'none'}"
+            )
+            self.log.emit(f"Processing: {session}/multicam: OK: {detail}")
+            self.status.emit(f"{session}: {detail}")
+            self._append_manifest(session, "multicam", "multicam_sync", True, detail)
+            return True
+
+        if not MULTICAM_SYNC_AUDIT_AVAILABLE or run_multicam_sync_audit is None:
+            msg = "MULTICAM_SYNC_AUDIT_UNAVAILABLE import failed"
             self.log.emit(f"Processing: {session}/multicam: FAIL: {msg}")
             self._append_manifest(session, "multicam", "multicam_sync", False, msg)
             return False
@@ -1930,7 +1994,7 @@ echo "LOCAL_PROCESSED_DELETED $CAM bytes=$BYTES marker=$MARKER"
         try:
             result = run_multicam_sync_audit(
                 local_dir,
-                expected_cameras=[spec.cam for spec in self.camera_specs],
+                expected_cameras=expected_cameras,
                 camera_hosts=camera_hosts,
                 remote_sessions_root=self.remote_sessions_root,
                 processed_subdir=self.processed_subdir,
@@ -1992,9 +2056,10 @@ while IFS= read -r -d '' path; do
   printf '%s\t%s\t%s\n' "$rel" "$(stat -c %s "$path")" "$(sha256sum "$path" | awk '{{print $1}}')"
 done < <(find . -maxdepth 1 -type f -name '*.metadata.yaml' -print0 | sort -z)
 
-if [[ -f "${{CAM}}_first.png" ]]; then
-  printf '%s\t%s\t-\n' "${{CAM}}_first.png" "$(stat -c %s "${{CAM}}_first.png")"
-fi
+while IFS= read -r -d '' path; do
+  rel="${{path#./}}"
+  printf '%s\t%s\t-\n' "$rel" "$(stat -c %s "$path")"
+done < <(find . -maxdepth 1 -type f \( -name "${{CAM}}_first.png" -o -name "${{CAM}}_*.first.png" \) -print0 | sort -z)
 """.strip()
 
     @staticmethod
@@ -2812,17 +2877,48 @@ class ProcessingPanel(QtWidgets.QWidget):
     @QtCore.Slot()
     def refresh_sessions(self) -> None:
         base = self._base_dir()
+
+        # Preserve the user's session selection across refreshes. This matters
+        # now that entering the Processing tab refreshes automatically; otherwise
+        # a carefully chosen subset gets silently replaced by "everything".
+        previous_items = self.session_list.count()
+        previous_selection = {
+            self.session_list.item(i).text()
+            for i in range(previous_items)
+            if self.session_list.item(i).isSelected()
+        }
+
         self.session_list.clear()
         sessions = []
         if base.is_dir():
             for child in sorted(base.iterdir(), key=lambda p: p.name):
                 if child.is_dir() and (child / "session.yaml").exists():
                     sessions.append(child.name)
+
+        restored = 0
+        initial_load = previous_items == 0
+
         for name in sessions:
             item = QtWidgets.QListWidgetItem(name)
-            item.setSelected(True)
             self.session_list.addItem(item)
-        self.status_label.setText(f"Found {len(sessions)} local sessions under {base}")
+
+            if previous_selection:
+                selected = name in previous_selection
+            else:
+                # Preserve old startup behavior: first population selects all.
+                # Later refreshes with no selection should keep no selection.
+                selected = initial_load
+
+            item.setSelected(selected)
+            if selected:
+                restored += 1
+
+        if previous_selection:
+            self.status_label.setText(
+                f"Found {len(sessions)} local sessions under {base}; restored {restored} selected."
+            )
+        else:
+            self.status_label.setText(f"Found {len(sessions)} local sessions under {base}")
 
     def _selected_sessions(self) -> List[str]:
         return [item.text() for item in self.session_list.selectedItems()]
