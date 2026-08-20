@@ -259,7 +259,7 @@ rigs:
         command: "sleep 1; pkill -INT -f '[t]readmill_control.*treadmill_host' || true; sleep 2; pkill -TERM -f '[t]readmill_control.*treadmill_host' || true"
 
   - key: gavin_tmill_4cams_tbox_100hz_cam5
-    label: andy_tmill_4cams_tbox_100hz_cam5
+    label: gavin_tmill_4cams_tbox_100hz_cam5
     description: "Merb rig: tmill master with local triggerbox and remote cam1,2,3 and 5."
     has_triggerbox: true
     telemetry:
