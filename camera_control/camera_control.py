@@ -93,6 +93,23 @@ DISCOVERY_INTERVAL_MS = 1500
 STATUS_INTERVAL_MS = 1000
 SPIN_INTERVAL_MS = 10
 
+# Settle time between disabling triggerbox output (pulses off, all cameras stop
+# on the identical hardware pulse) and issuing the RAM-buffer dump request, so
+# any already-triggered "straggler" frames still in flight through the
+# camera/SDK pipeline land in the ring before it's read. See
+# PINGPONG_GUI_PLAN.md section 2.
+RAM_DUMP_TRIGGER_SETTLE_MS = 100
+
+# ram_buffer_state values reported by GetStatus (cambuffer_recorder_ng/srv/GetStatus,
+# only meaningful when ram_buffer.dump_policy=="continue_acquisition") and how the
+# GUI displays them.
+RAM_BUFFER_STATE_LABELS = {
+    "rec": "Rec",
+    "saving": "Saving",
+    "filling": "Filling",
+}
+RAM_BUFFER_BUSY_STATES = {"saving", "filling"}
+
 
 # --------------------------
 # Small helpers
@@ -1259,12 +1276,13 @@ class CameraTable(QtWidgets.QTableWidget):
     COL_STATE = 1
     COL_CONFIGURED = 2
     COL_RECORDING = 3
-    COL_MODE = 4
-    COL_OUTPUT = 5
+    COL_BUFFER = 4
+    COL_MODE = 5
+    COL_OUTPUT = 6
 
     def __init__(self):
-        super().__init__(0, 6)
-        self.setHorizontalHeaderLabels(["Camera", "State", "Cfg", "Rec", "Mode", "Output"])
+        super().__init__(0, 7)
+        self.setHorizontalHeaderLabels(["Camera", "State", "Cfg", "Rec", "Buffer", "Mode", "Output"])
         header = self.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
@@ -1273,6 +1291,7 @@ class CameraTable(QtWidgets.QTableWidget):
         self.setColumnWidth(self.COL_STATE, 90)
         self.setColumnWidth(self.COL_CONFIGURED, 45)
         self.setColumnWidth(self.COL_RECORDING, 45)
+        self.setColumnWidth(self.COL_BUFFER, 60)
         self.setColumnWidth(self.COL_MODE, 150)
         self.setMinimumWidth(650)
         self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -1280,15 +1299,21 @@ class CameraTable(QtWidgets.QTableWidget):
         self.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.verticalHeader().setVisible(False)
         self._row_nodes: List[Tuple[str, str, str]] = []
+        # full node name -> raw ram_buffer_state from the last GetStatus response
+        # ("rec"/"saving"/"filling", or "" for non-ram-buffer modes/unknown).
+        self._ram_buffer_states: Dict[str, str] = {}
 
     def set_nodes(self, nodes: List[Tuple[str, str, str]]):
         selected = set(self.selected_full_names())
         self.setRowCount(0)
         self._row_nodes = nodes
+        self._ram_buffer_states = {
+            full: state for full, state in self._ram_buffer_states.items() if full in {f for _, _, f in nodes}
+        }
         for name, ns, full in nodes:
             row = self.rowCount()
             self.insertRow(row)
-            for col, text in enumerate([full, "unknown", "?", "?", "", ""]):
+            for col, text in enumerate([full, "unknown", "?", "?", "", "", ""]):
                 self.setItem(row, col, QtWidgets.QTableWidgetItem(text))
             if full in selected:
                 self.selectRow(row)
@@ -1305,16 +1330,23 @@ class CameraTable(QtWidgets.QTableWidget):
         return [x[2] for x in self._row_nodes]
 
     def update_status(self, full: str, status: Any):
+        raw_state = str(getattr(status, "ram_buffer_state", "") or "")
+        self._ram_buffer_states[full] = raw_state
         for row, (_, _, f) in enumerate(self._row_nodes):
             if f != full:
                 continue
             self.item(row, self.COL_STATE).setText(status.state)
             self.item(row, self.COL_CONFIGURED).setText("yes" if status.configured else "no")
             self.item(row, self.COL_RECORDING).setText("yes" if status.recording else "no")
+            self.item(row, self.COL_BUFFER).setText(RAM_BUFFER_STATE_LABELS.get(raw_state, "-"))
             self.item(row, self.COL_MODE).setText(status.mode)
             out = status.rolling_path_prefix or status.output_path or status.metadata_path
             self.item(row, self.COL_OUTPUT).setText(out)
             break
+
+    def ram_buffer_busy(self, full_names: List[str]) -> bool:
+        """True if any of the given nodes' last-known ram_buffer_state is saving/filling."""
+        return any(self._ram_buffer_states.get(full, "") in RAM_BUFFER_BUSY_STATES for full in full_names)
 
 
 class CameraPanel(QtWidgets.QGroupBox):
@@ -1813,6 +1845,17 @@ class CameraPanel(QtWidgets.QGroupBox):
             self.log(f"status failed for {full}: {e}")
             return
         self.table.update_status(full, resp)
+        self._update_dump_button_enabled()
+
+    def _update_dump_button_enabled(self) -> None:
+        """Mirror the server's saving/filling dump rejection in the UI (a UX
+        nicety, not a safety mechanism - the server still enforces this)."""
+        if self._active_dump_batch is not None:
+            # dump_ram_buffer()/_complete_dump_batch() own enablement while a
+            # dump batch is in flight; don't fight them.
+            return
+        busy = self.table.ram_buffer_busy(self.table.selected_full_names())
+        self.dump_btn.setEnabled(not busy)
 
     def build_settings_for_node(self, full: str, md: Optional[SessionMetadata]) -> str:
         self._commit_setting_editors()
@@ -2441,10 +2484,14 @@ class CameraPanel(QtWidgets.QGroupBox):
 
         batch["pulses_disabled"] = True
         self.log(
-            f"RAM dump {batch['label']}: trigger output disabled; allowing 100 ms for the serial gate "
-            "command and final camera/USB frames to settle"
+            f"RAM dump {batch['label']}: trigger output disabled; allowing "
+            f"{RAM_DUMP_TRIGGER_SETTLE_MS} ms for the serial gate command and final "
+            "camera/USB frames to settle"
         )
-        QtCore.QTimer.singleShot(100, lambda batch_id=batch_id: self._issue_synced_dump_requests(batch_id))
+        QtCore.QTimer.singleShot(
+            RAM_DUMP_TRIGGER_SETTLE_MS,
+            lambda batch_id=batch_id: self._issue_synced_dump_requests(batch_id),
+        )
 
     def _issue_synced_dump_requests(self, batch_id: int) -> None:
         batch = self._dump_batch(batch_id)
