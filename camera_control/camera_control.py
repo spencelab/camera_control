@@ -116,6 +116,28 @@ RAM_BUFFER_BUSY_STATES = {"saving", "filling"}
 # as that event arrives -- see CameraPanel._on_raw_camera_event.
 HARDWARE_TRIGGER_RATE_RE = re.compile(r"approximately\s+([\d.]+)\s*Hz")
 
+# recording_event's event_type field, e.g. 'event_type: "ram_buffer_pause_acquisition"'
+# (CamBufferRecorderNode::publishRecordingEvent's flattened-YAML format).
+RECORDING_EVENT_TYPE_RE = re.compile(r'^event_type:\s*"([^"]*)"', re.MULTILINE)
+
+# pause_acquisition's dump() blocks the recorder's single ROS executor for its
+# entire stop-drain-restart duration (unlike continue_acquisition, whose dump
+# handler returns almost instantly), so GetStatus/ram_buffer_state can't be
+# polled during a pause_acquisition dump at all -- it's always just "rec"
+# there anyway (see ramBufferState() in RamCircularRawRecorder.cpp), there's no
+# per-ring "filling" concept in a single-ring design. But
+# ram_buffer_pause_acquisition/ram_buffer_resume_acquisition are emitted as
+# live publishes from *inside* that same blocking call (publishing doesn't
+# need the executor, only answering a service call does), so they reach the
+# GUI in real time regardless. Map them straight to a Buffer-column label,
+# bypassing the (blocked) GetStatus round trip entirely. continue_acquisition
+# doesn't emit either of these event types, so this never affects that mode -
+# its Buffer column stays driven by the authoritative ram_buffer_state poll.
+PAUSE_ACQUISITION_BUFFER_EVENTS = {
+    "ram_buffer_pause_acquisition": "saving",
+    "ram_buffer_resume_acquisition": "rec",
+}
+
 
 # --------------------------
 # Small helpers
@@ -1417,6 +1439,17 @@ class CameraTable(QtWidgets.QTableWidget):
             self.item(row, self.COL_DISK).setText(f"{gib:.1f} GiB")
             break
 
+    def update_buffer_state_direct(self, full: str, raw_state: str) -> None:
+        """Set the Buffer column (and busy-tracking) directly from a raw_state
+        string, bypassing GetStatus - for signals that arrive as a live event
+        instead of a poll response (see PAUSE_ACQUISITION_BUFFER_EVENTS)."""
+        self._ram_buffer_states[full] = raw_state
+        for row, (_, _, f) in enumerate(self._row_nodes):
+            if f != full:
+                continue
+            self.item(row, self.COL_BUFFER).setText(RAM_BUFFER_STATE_LABELS.get(raw_state, "-"))
+            break
+
 
 class CameraPanel(QtWidgets.QGroupBox):
     def __init__(self, ros: CameraControlRos, metadata_panel: MetadataPanel, bottom_left_widget: Optional[QtWidgets.QWidget] = None):
@@ -1953,12 +1986,25 @@ class CameraPanel(QtWidgets.QGroupBox):
         fut = self.ros.get_status_async(full)
         fut.add_done_callback(lambda f, full=full: self._status_done(full, f))
 
-        match = HARDWARE_TRIGGER_RATE_RE.search(str(getattr(msg, "data", "")))
+        text = str(getattr(msg, "data", ""))
+
+        match = HARDWARE_TRIGGER_RATE_RE.search(text)
         if match:
             try:
                 self.table.update_fps(full, float(match.group(1)))
             except ValueError:
                 pass
+
+        # pause_acquisition blocks GetStatus for the whole dump, so the get_status_async
+        # call just above won't resolve until it's already over. These two event types
+        # are pause_acquisition-only and are published from inside that same blocking
+        # call, so they still reach us live - use them to update Buffer directly instead
+        # of waiting. See PAUSE_ACQUISITION_BUFFER_EVENTS.
+        type_match = RECORDING_EVENT_TYPE_RE.search(text)
+        if type_match:
+            raw_state = PAUSE_ACQUISITION_BUFFER_EVENTS.get(type_match.group(1))
+            if raw_state is not None:
+                self.table.update_buffer_state_direct(full, raw_state)
 
     def build_settings_for_node(self, full: str, md: Optional[SessionMetadata]) -> str:
         self._commit_setting_editors()
