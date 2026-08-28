@@ -110,6 +110,12 @@ RAM_BUFFER_STATE_LABELS = {
 }
 RAM_BUFFER_BUSY_STATES = {"saving", "filling"}
 
+# There's no dedicated live-fps field/topic; cambuffer_recorder_ng's periodic
+# hardware_trigger_rate recording_event is the only source, e.g. "...rate
+# approximately 249.734635 Hz; expected 250.000000 Hz." Parsed opportunistically
+# as that event arrives -- see CameraPanel._on_raw_camera_event.
+HARDWARE_TRIGGER_RATE_RE = re.compile(r"approximately\s+([\d.]+)\s*Hz")
+
 
 # --------------------------
 # Small helpers
@@ -442,6 +448,7 @@ class CameraControlRos(Node):
         self._treadmill_status_sub = None
         self._treadmill_status_callback = None
         self._event_callback = None
+        self._raw_event_callback = None
 
     def set_event_callback(self, callback):
         """Set GUI callback for camera event log lines.
@@ -450,6 +457,16 @@ class CameraControlRos(Node):
         callbacks run on the GUI thread and can safely update widgets.
         """
         self._event_callback = callback
+
+    def set_raw_event_callback(self, callback):
+        """Set GUI callback invoked with (full_name, topic_suffix, msg) for every
+        settings_event/recording_event/storage-free-gib message, in addition to
+        (not instead of) the formatted log line set_event_callback() gets. Lets the
+        GUI react to a live topic the instant it arrives -- e.g. an opportunistic
+        status refresh on recording_event, or reading a numeric field straight off
+        the message -- rather than waiting for the next status_timer poll tick.
+        """
+        self._raw_event_callback = callback
 
     def _emit_event(self, full_name: str, topic_label: str, payload: str):
         if self._event_callback is not None:
@@ -475,6 +492,8 @@ class CameraControlRos(Node):
                 except Exception as e:
                     text = f"<format error: {e}>"
                 self._emit_event(full, label, text)
+                if self._raw_event_callback is not None:
+                    self._raw_event_callback(full, label, msg)
 
             self._event_subs[topic] = self.create_subscription(msg_type, topic, cb, 10)
 
@@ -1276,13 +1295,17 @@ class CameraTable(QtWidgets.QTableWidget):
     COL_STATE = 1
     COL_CONFIGURED = 2
     COL_RECORDING = 3
-    COL_BUFFER = 4
-    COL_MODE = 5
-    COL_OUTPUT = 6
+    COL_FPS = 4
+    COL_DISK = 5
+    COL_BUFFER = 6
+    COL_MODE = 7
+    COL_OUTPUT = 8
 
     def __init__(self):
-        super().__init__(0, 7)
-        self.setHorizontalHeaderLabels(["Camera", "State", "Cfg", "Rec", "Buffer", "Mode", "Output"])
+        super().__init__(0, 9)
+        self.setHorizontalHeaderLabels(
+            ["Camera", "State", "Cfg", "Rec", "FPS", "Disk", "Buffer", "Mode", "Output"]
+        )
         header = self.horizontalHeader()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
@@ -1291,6 +1314,8 @@ class CameraTable(QtWidgets.QTableWidget):
         self.setColumnWidth(self.COL_STATE, 90)
         self.setColumnWidth(self.COL_CONFIGURED, 45)
         self.setColumnWidth(self.COL_RECORDING, 45)
+        self.setColumnWidth(self.COL_FPS, 65)
+        self.setColumnWidth(self.COL_DISK, 75)
         self.setColumnWidth(self.COL_BUFFER, 60)
         self.setColumnWidth(self.COL_MODE, 150)
         self.setMinimumWidth(650)
@@ -1304,16 +1329,43 @@ class CameraTable(QtWidgets.QTableWidget):
         self._ram_buffer_states: Dict[str, str] = {}
 
     def set_nodes(self, nodes: List[Tuple[str, str, str]]):
+        if nodes == self._row_nodes:
+            # Nothing actually changed (the common case: discover_timer fires every
+            # 1.5s and finds the same cameras it already knew about). Rebuilding
+            # unconditionally here used to reset every Cfg/Rec/Buffer/etc. cell back
+            # to its "?"/blank placeholder on every tick, which was visible as a
+            # spurious flicker-to-"?" any time a status response took a moment to
+            # come back (e.g. a multi-second pause_acquisition dump). Bail out so
+            # already-known rows are left alone.
+            return
+
         selected = set(self.selected_full_names())
+        n_cols = self.columnCount()
+        # Capture each currently-known row's live cell text by full name so a
+        # genuine node-set change (camera added/removed/reordered) doesn't also
+        # wipe the columns for cameras that didn't actually change.
+        existing_cells: Dict[str, List[str]] = {}
+        for row, (_, _, full) in enumerate(self._row_nodes):
+            existing_cells[full] = [
+                (self.item(row, c).text() if self.item(row, c) else "") for c in range(n_cols)
+            ]
+
         self.setRowCount(0)
         self._row_nodes = nodes
+        known_full_names = {full for _, _, full in nodes}
         self._ram_buffer_states = {
-            full: state for full, state in self._ram_buffer_states.items() if full in {f for _, _, f in nodes}
+            full: state for full, state in self._ram_buffer_states.items() if full in known_full_names
         }
         for name, ns, full in nodes:
             row = self.rowCount()
             self.insertRow(row)
-            for col, text in enumerate([full, "unknown", "?", "?", "", "", ""]):
+            texts = existing_cells.get(full)
+            if texts is None:
+                # Brand-new row: the only case that should ever show placeholders.
+                texts = [full, "unknown", "?", "?"] + [""] * (n_cols - 4)
+            if len(texts) < n_cols:
+                texts = texts + [""] * (n_cols - len(texts))
+            for col, text in enumerate(texts[:n_cols]):
                 self.setItem(row, col, QtWidgets.QTableWidgetItem(text))
             if full in selected:
                 self.selectRow(row)
@@ -1347,6 +1399,23 @@ class CameraTable(QtWidgets.QTableWidget):
     def ram_buffer_busy(self, full_names: List[str]) -> bool:
         """True if any of the given nodes' last-known ram_buffer_state is saving/filling."""
         return any(self._ram_buffer_states.get(full, "") in RAM_BUFFER_BUSY_STATES for full in full_names)
+
+    def update_fps(self, full: str, fps: float) -> None:
+        """Live measured acquisition rate, parsed from a hardware_trigger_rate
+        recording_event as it arrives (there's no dedicated fps field/topic)."""
+        for row, (_, _, f) in enumerate(self._row_nodes):
+            if f != full:
+                continue
+            self.item(row, self.COL_FPS).setText(f"{fps:.2f}")
+            break
+
+    def update_disk_free(self, full: str, gib: float) -> None:
+        """Free space at the node's output path, from its storage/free_gib topic."""
+        for row, (_, _, f) in enumerate(self._row_nodes):
+            if f != full:
+                continue
+            self.item(row, self.COL_DISK).setText(f"{gib:.1f} GiB")
+            break
 
 
 class CameraPanel(QtWidgets.QGroupBox):
@@ -1532,6 +1601,12 @@ class CameraPanel(QtWidgets.QGroupBox):
         self.discover_timer.setInterval(DISCOVERY_INTERVAL_MS)
         self.discover_timer.timeout.connect(self.discover)
         self.discover_timer.start()
+
+        # Opportunistic refresh: react the instant a camera publishes an event,
+        # instead of waiting for the next status_timer tick (up to STATUS_INTERVAL_MS
+        # later). Layered on top of the periodic poll, not a replacement for it --
+        # the poll remains the fallback if an event is ever missed.
+        self.ros.set_raw_event_callback(self._on_raw_camera_event)
 
     # ---- settings dirty/clean model ----
     def tracked_setting_widgets(self) -> Dict[str, QtWidgets.QWidget]:
@@ -1856,6 +1931,34 @@ class CameraPanel(QtWidgets.QGroupBox):
             return
         busy = self.table.ram_buffer_busy(self.table.selected_full_names())
         self.dump_btn.setEnabled(not busy)
+
+    def _on_raw_camera_event(self, full: str, suffix: str, msg: Any) -> None:
+        """Fired the instant a subscribed topic message arrives (see
+        CameraControlRos.set_raw_event_callback) - independent of, and much
+        faster than, the STATUS_INTERVAL_MS status_timer poll."""
+        if suffix == "storage/free_gib":
+            try:
+                self.table.update_disk_free(full, float(msg.data))
+            except (TypeError, ValueError):
+                pass
+            return
+
+        if suffix != "recording_event":
+            return
+
+        # Any recording_event means something about this camera's recording/
+        # ram_buffer state just changed server-side (dump accepted/failed/
+        # complete, pause/resume, start/stop, ...) - refresh now rather than
+        # waiting up to STATUS_INTERVAL_MS for the next poll to notice.
+        fut = self.ros.get_status_async(full)
+        fut.add_done_callback(lambda f, full=full: self._status_done(full, f))
+
+        match = HARDWARE_TRIGGER_RATE_RE.search(str(getattr(msg, "data", "")))
+        if match:
+            try:
+                self.table.update_fps(full, float(match.group(1)))
+            except ValueError:
+                pass
 
     def build_settings_for_node(self, full: str, md: Optional[SessionMetadata]) -> str:
         self._commit_setting_editors()
