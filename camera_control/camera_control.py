@@ -1349,6 +1349,10 @@ class CameraTable(QtWidgets.QTableWidget):
         # full node name -> raw ram_buffer_state from the last GetStatus response
         # ("rec"/"saving"/"filling", or "" for non-ram-buffer modes/unknown).
         self._ram_buffer_states: Dict[str, str] = {}
+        # full node name -> last-known status.recording, for the system-wide
+        # banner (see CameraPanel._update_dump_alert_label): only recording
+        # nodes' ram_buffer_state should factor into that aggregate.
+        self._recording: Dict[str, bool] = {}
 
     def set_nodes(self, nodes: List[Tuple[str, str, str]]):
         if nodes == self._row_nodes:
@@ -1378,6 +1382,9 @@ class CameraTable(QtWidgets.QTableWidget):
         self._ram_buffer_states = {
             full: state for full, state in self._ram_buffer_states.items() if full in known_full_names
         }
+        self._recording = {
+            full: rec for full, rec in self._recording.items() if full in known_full_names
+        }
         for name, ns, full in nodes:
             row = self.rowCount()
             self.insertRow(row)
@@ -1406,6 +1413,7 @@ class CameraTable(QtWidgets.QTableWidget):
     def update_status(self, full: str, status: Any):
         raw_state = str(getattr(status, "ram_buffer_state", "") or "")
         self._ram_buffer_states[full] = raw_state
+        self._recording[full] = bool(getattr(status, "recording", False))
         for row, (_, _, f) in enumerate(self._row_nodes):
             if f != full:
                 continue
@@ -1421,6 +1429,21 @@ class CameraTable(QtWidgets.QTableWidget):
     def ram_buffer_busy(self, full_names: List[str]) -> bool:
         """True if any of the given nodes' last-known ram_buffer_state is saving/filling."""
         return any(self._ram_buffer_states.get(full, "") in RAM_BUFFER_BUSY_STATES for full in full_names)
+
+    def recording_full_names(self) -> List[str]:
+        """Full names of nodes whose last-known GetStatus reported recording=True."""
+        return [full for full in self.all_full_names() if self._recording.get(full, False)]
+
+    def aggregate_ram_buffer_state(self, full_names: List[str]) -> str:
+        """Worst-case ram_buffer_state across the given nodes: a system-wide
+        indicator has to reflect the most restrictive thing any one camera is
+        doing, not an arbitrary single node. Priority: saving > filling > rec.
+        Returns "" if none of the given nodes have a known state yet."""
+        states = {self._ram_buffer_states.get(full, "") for full in full_names}
+        for candidate in ("saving", "filling", "rec"):
+            if candidate in states:
+                return candidate
+        return ""
 
     def update_fps(self, full: str, fps: float) -> None:
         """Live measured acquisition rate, parsed from a hardware_trigger_rate
@@ -1473,7 +1496,6 @@ class CameraPanel(QtWidgets.QGroupBox):
         self._recording_alert_blink_on = False
         self._recording_alert_last_beep_bucket = -1
         self._dump_alert_count = 0
-        self._dump_alert_blink_on = False
         self._recording_alert_timer = QtCore.QTimer(self)
         self._recording_alert_timer.setInterval(500)
         self._recording_alert_timer.timeout.connect(self._recording_alert_tick)
@@ -1954,6 +1976,7 @@ class CameraPanel(QtWidgets.QGroupBox):
             return
         self.table.update_status(full, resp)
         self._update_dump_button_enabled()
+        self._update_dump_alert_label()
 
     def _update_dump_button_enabled(self) -> None:
         """Mirror the server's saving/filling dump rejection in the UI (a UX
@@ -2005,6 +2028,8 @@ class CameraPanel(QtWidgets.QGroupBox):
             raw_state = PAUSE_ACQUISITION_BUFFER_EVENTS.get(type_match.group(1))
             if raw_state is not None:
                 self.table.update_buffer_state_direct(full, raw_state)
+                self._update_dump_button_enabled()
+                self._update_dump_alert_label()
 
     def build_settings_for_node(self, full: str, md: Optional[SessionMetadata]) -> str:
         self._commit_setting_editors()
@@ -2291,9 +2316,27 @@ class CameraPanel(QtWidgets.QGroupBox):
         return "ram_buffer" in self._effective_gui_mode()
 
     def _update_dump_alert_label(self) -> None:
-        self._dump_alert_blink_on = not self._dump_alert_blink_on
-        dot = "●" if self._dump_alert_blink_on else "○"
-        self.recording_alert_label.setText(f"{dot} DUMP {self._dump_alert_count}")
+        """Refresh the system-wide ram_buffer-mode banner. Safe to call from
+        anywhere (status poll, live event, dump-batch completion) - it's a
+        no-op unless the banner is actually up for this mode, so callers
+        don't need to guard it themselves.
+
+        Text reflects the worst-case ram_buffer_state across every node
+        currently recording (see CameraTable.aggregate_ram_buffer_state):
+        one camera still saving or filling means the *system* isn't ready
+        for another dump, even if every other camera already is.
+        """
+        if not (self.recording_alert_label.isVisible() and self._is_ram_buffer_mode()):
+            return
+        state = self.table.aggregate_ram_buffer_state(self.table.recording_full_names())
+        if state == "saving":
+            text = "SAVING WHILE RECORDING"
+        elif state == "filling":
+            text = "RECORDING - BUFFER NOT FULL"
+        else:
+            # "rec", or unknown/no nodes reporting yet -- default to ready.
+            text = f"READY ({self._dump_alert_count} DUMPS)"
+        self.recording_alert_label.setText(text)
 
     def _set_recording_alert_active(self, active: bool) -> None:
         if active and "_rolling" in self._effective_gui_mode():
@@ -2310,7 +2353,6 @@ class CameraPanel(QtWidgets.QGroupBox):
             self._recording_alert_started_monotonic = None
             self._recording_alert_last_beep_bucket = -1
             self._dump_alert_count = 0
-            self._dump_alert_blink_on = True
             self.recording_alert_label.setVisible(True)
             self._update_dump_alert_label()
             return
