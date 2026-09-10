@@ -1,0 +1,31 @@
+processing:
+  local_sessions_root: "/home/spencelab/camera_sessions"
+  remote_sessions_root: "/home/spencelab/camera_sessions"
+
+  max_parallel_cameras: 5
+
+  cameras:
+    - cam1@local
+
+  conversion:
+    # MP4 playback FPS only. Raw audit acquisition FPS comes from recorded
+    # metadata. 10x slowdown for 250 Hz acquisitionz rolling-hwtrigger pairing.
+    fps: 250.0
+    # Mono/near-IR: raw_rolling_to_mp4 detects RAW8_MONO payloads and ignores
+    # white-balance gains outright (it warns and skips them even if enabled)
+    # -- there are no color channels to balance. Left neutral rather than
+    # copying a Bayer camera's calibrated r/g/b values, which would be
+    # misleading here even though functionally inert.
+    r_gain: 1.0
+    g_gain: 1.0
+    b_gain: 1.0
+    gamma: 1.0
+    audit_threshold_frames: 1.5
+
+  upload:
+    host: "spencenquist.dyndns.org"
+    user: "spencelab"
+    port: "44717"
+    root: "/zfsr01/storage/camera_sessions_uploads"
+    verify: "size"
+    max_parallel_uploads: 5
