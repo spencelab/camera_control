@@ -9,8 +9,9 @@ processing:
 
   conversion:
     # MP4 playback FPS only. Raw audit acquisition FPS comes from recorded
-    # metadata. 10x slowdown for 250 Hz acquisitionz rolling-hwtrigger pairing.
-    fps: 250.0
+    # metadata. 10x slowdown for 250 Hz ram_buffer acquisition, same
+    # convention as processing_nofall_mono_rolling.yaml's 10.0 for 100 Hz.
+    fps: 25.0
     # Mono/near-IR: raw_rolling_to_mp4 detects RAW8_MONO payloads and ignores
     # white-balance gains outright (it warns and skips them even if enabled)
     # -- there are no color channels to balance. Left neutral rather than
