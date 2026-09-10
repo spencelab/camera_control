@@ -131,6 +131,30 @@ rigs:
       - name: kill_triggerbox_host
         command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
 
+  - key: nofall_local_1cam_mono_tbox_rambuf
+    label: nofall_local_1cam_mono_tbox_rambuf
+    description: "nofall: standalone dev box. Local triggerbox and local mono/near-IR XIMEA camera (cam1). 250fps ram dumps. No treadmill."
+    has_triggerbox: true
+    telemetry:
+      treadmill: "off"
+      triggerbox: required
+      camera_events: true
+    configure_delay_ms: 4000
+    discover_delay_ms: 6000
+    camera_nodes: [cam1]
+    processes:
+      - name: triggerbox_host
+        command: "ros2 run triggerbox_ros2 triggerbox_host --device /dev/trig5 --ros-args -p default_fps:=250.0"
+      - name: cam1
+        command: "ros2 run cambuffer_recorder_ng cambuffer_recorder_ng --ros-args -r __node:=cam1 --params-file ~/ros2_ws/src/cambuffer_recorder_ng/config/ximea_raw8mono_ram_buffer_hwtrigger.yaml"
+    shutdown_commands:
+      - name: disable_trigger_output
+        command: 'timeout 5s ros2 service call /triggerbox_host/disable_output std_srvs/srv/Trigger "{}" || true'
+      - name: shutdown_cam1
+        command: "timeout 10s ros2 lifecycle set /cam1 shutdown || true"
+      - name: kill_triggerbox_host
+        command: "sleep 2; pkill -TERM -f '[t]riggerbox_host' || true; sleep 2; pkill -KILL -f '[t]riggerbox_host' || true"
+        
   - key: maincampus_camdev_2cams_tbox
     label: maincampus_camdev_2cams_tbox
     description: "Main campus rig: local triggerbox_host, local cam1, remote cam2 on 10.0.0.2 as spencelab."
